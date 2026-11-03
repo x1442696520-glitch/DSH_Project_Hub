@@ -1,0 +1,3 @@
+nodeLinker: hoisted
+allowBuilds:
+  protobufjs: false
