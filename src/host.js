@@ -1,9 +1,22 @@
 import { randomUUID } from 'node:crypto'
-import { Entry } from '@napi-rs/keyring'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { Service } from '@deepseek-ai/cordis'
 import { WeComAIBotClient } from './wecom-api.js'
 import { FeishuClient } from './feishu-api.js'
+
+let KeyringEntry
+try {
+  ({ Entry: KeyringEntry } = await import('@napi-rs/keyring'))
+} catch {
+  // Missing optional native bindings must not disable the rest of Project Hub.
+}
+
+function createKeyringEntry(service, account) {
+  if (typeof KeyringEntry !== 'function') {
+    throw new Error('系统凭证库原生模块不可用；请重新安装插件依赖，或改用 Host 环境变量配置机器人凭证')
+  }
+  return new KeyringEntry(service, account)
+}
 
 const ROUTE = '/api/project-hub'
 const ROOT = 'projects' // legacy layout, retained only for safe migration
@@ -703,7 +716,7 @@ class ProjectHub extends Service {
   }
 
   createWeComCredentialEntry() {
-    return new Entry(WECOM_CREDENTIAL_SERVICE, WECOM_CREDENTIAL_ACCOUNT)
+    return createKeyringEntry(WECOM_CREDENTIAL_SERVICE, WECOM_CREDENTIAL_ACCOUNT)
   }
 
   readStoredWeComCredentials() {
@@ -722,7 +735,7 @@ class ProjectHub extends Service {
   }
 
   createFeishuCredentialEntry() {
-    return new Entry(WECOM_CREDENTIAL_SERVICE, FEISHU_CREDENTIAL_ACCOUNT)
+    return createKeyringEntry(WECOM_CREDENTIAL_SERVICE, FEISHU_CREDENTIAL_ACCOUNT)
   }
 
   readStoredFeishuCredentials() {
@@ -912,7 +925,7 @@ class ProjectHub extends Service {
   }
 
   createFeishuBindingEntry() {
-    return new Entry(WECOM_CREDENTIAL_SERVICE, FEISHU_BINDING_ACCOUNT)
+    return createKeyringEntry(WECOM_CREDENTIAL_SERVICE, FEISHU_BINDING_ACCOUNT)
   }
 
   readStoredFeishuConversations() {
@@ -1165,7 +1178,7 @@ class ProjectHub extends Service {
   }
 
   createWeComBindingEntry() {
-    return new Entry(WECOM_CREDENTIAL_SERVICE, WECOM_BINDING_ACCOUNT)
+    return createKeyringEntry(WECOM_CREDENTIAL_SERVICE, WECOM_BINDING_ACCOUNT)
   }
 
   readStoredWeComBinding() {

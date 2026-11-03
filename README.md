@@ -27,6 +27,8 @@ pnpm run build
 
 随后在 DSH 插件管理界面选择“安装本地目录”，指向克隆后的目录并启用 `dsh-project-hub`。更新源码后重新运行 `pnpm run build`，再从 DSH 插件管理界面重新加载插件。
 
+如果已有安装因缺少 `@napi-rs/keyring` 平台原生模块而无法启动，可在插件目录运行 `pnpm install --force` 后重新加载 Host。更新后的插件在系统凭证库无法加载时仍可使用项目管理功能；机器人凭证可改由 Host 进程环境变量提供。
+
 ## 机器人凭证
 
 优先在 Project Hub 的“办公集成”页面配置凭证。Host 会尝试将凭证保存到操作系统凭证库；凭证值不会返回浏览器。也可在启动 DSH Host 的进程环境中配置：
@@ -52,4 +54,3 @@ pnpm run build
 ## 许可证
 
 MIT License。依赖项各自的许可证仍然适用。
-
