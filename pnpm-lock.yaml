@@ -23,6 +23,9 @@ importers:
       '@wecom/aibot-node-sdk':
         specifier: 1.0.7
         version: 1.0.7(debug@4.4.3)
+      eventemitter3:
+        specifier: 5.0.4
+        version: 5.0.4
 
 packages:
 

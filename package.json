@@ -33,6 +33,7 @@
   "dependencies": {
     "@napi-rs/keyring": "2.1.0",
     "@larksuiteoapi/node-sdk": "1.76.0",
-    "@wecom/aibot-node-sdk": "1.0.7"
+    "@wecom/aibot-node-sdk": "1.0.7",
+    "eventemitter3": "5.0.4"
   }
 }
