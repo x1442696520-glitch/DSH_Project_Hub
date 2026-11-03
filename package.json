@@ -1,0 +1,38 @@
+{
+  "name": "dsh-project-hub",
+  "version": "0.1.0",
+  "description": "Workspace-scoped project management and messaging integrations for DeepSeek Harness",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.5",
+    "@deepseek-ai/dsh-tools": "~0.2.1-rc.3"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@napi-rs/keyring": "2.1.0",
+    "@larksuiteoapi/node-sdk": "1.76.0",
+    "@wecom/aibot-node-sdk": "1.0.7"
+  }
+}
