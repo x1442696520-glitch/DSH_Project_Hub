@@ -421,11 +421,12 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function Panel({ sessionId, onOpenSession, workspacePath, workspaceTitle, onSendFiles, onEnsureFiles, onNormalizeWorkspace }) {
+    function Panel({ sessionId, onOpenSession, workspaceId, workspacePath, workspaceTitle, onSendFiles, onEnsureFiles, onNormalizeWorkspace, onInitializeWorkspace }) {
       const [project, setProject] = useState(null)
       const activeId = project?.id || ''
       const [tab, setTab] = useState('overview')
       const [loading, setLoading] = useState(true)
+      const [initializing, setInitializing] = useState(false)
       const [normalizing, setNormalizing] = useState(false)
       const [error, setError] = useState('')
       const [editing, setEditing] = useState(null)
@@ -469,6 +470,15 @@ window.__ModuleLoader__.load({
         }).catch((e) => { if (alive) { setError(e.message); setLoading(false) } })
         return () => { alive = false }
       }, [sessionId])
+      const initializeCurrentWorkspace = async () => {
+        if (!workspaceId || !sessionId || initializing || !onInitializeWorkspace) return
+        setInitializing(true); setError('')
+        try {
+          const created = await onInitializeWorkspace({ sessionId, workspaceId, workspacePath, workspaceTitle })
+          setProject(created)
+        } catch (failure) { setError(failure.message || String(failure)) }
+        finally { setInitializing(false) }
+      }
       const applyProject = async (next) => { setProject(next) }
       const patchTask = async (taskId, patch) => {
         setError('')
@@ -690,7 +700,7 @@ window.__ModuleLoader__.load({
       const needsWorkspaceNormalization = Boolean(workspaceTitle && workspaceDirectoryName !== workspaceTitle)
       const normalizeCurrentWorkspace = async () => {
         if (!needsWorkspaceNormalization || normalizing || !onNormalizeWorkspace) return
-        if (!globalThis.confirm?.(`将把「${workspaceTitle}」项目迁移到同名目录。项目 ID 和助手 Session ID 将变化，旧会话历史保留但不再绑定。继续吗？`)) return
+        if (!globalThis.confirm?.(`将把「${workspaceTitle}」项目资料与任务迁移到同名目录，并创建新的 DSH Workspace 和项目助手 Session。迁移成功后，旧 Workspace 会保留为「旧」备份（其中的其他文件和 files/ 附件不会自动复制或合并），旧会话历史仍保留但不再绑定；项目 ID、Workspace ID 和助手 Session ID 会变化。是否继续？`)) return
         setNormalizing(true); setError('')
         try { await onNormalizeWorkspace(sessionId, project, workspacePath, workspaceTitle) }
         catch (failure) { setError(failure.message || String(failure)) }
@@ -740,6 +750,7 @@ window.__ModuleLoader__.load({
               h('input', { type: 'checkbox', 'aria-label': '同步对话到企业微信', checked: wecomPairing.syncMessages === true, disabled: wecomPairingBusy, onChange: setWeComReplySync }),
               '开启后，会把 DSH 或飞书来源的用户消息及助手可见答复镜像到企微并标注来源；企微发起的对话只在原聊天回复。关闭则不镜像；DSH 会话始终不加来源标签，后台上下文和推理内容不会转发。'
             ),
+            wecomPairing.state === 'bound' && h('p', { className: 'ph-muted', style: { marginTop: 8 } }, '已配对会话会在 DSH Host 运行时自动恢复；收到企微私聊后无需手动打开 DSH 会话窗口。恢复使用 DSH 当前可用的 Agent 配置，不保证还原原会话专属模型、工具或提示配置。'),
             wecomPairing.state === 'error' && h('p', { role: 'alert' }, wecomPairing.label),
             h('button', { type: 'button', className: 'ph-btn small primary', disabled: !project.assistantSessionId || project.wecomConnection?.state !== 'connected' || wecomPairingBusy, onClick: startWeComPairing }, wecomPairingBusy ? '处理中…' : wecomPairing.state === 'bound' ? '重新配对 UserID' : wecomPairing.state === 'bound-elsewhere' ? '迁移绑定到当前会话' : '生成我的单聊配对码'),
             wecomPairing.state === 'bound' && h('button', { type: 'button', className: 'ph-btn small', disabled: wecomPairingBusy, onClick: clearWeComPairing }, '解除 UserID 绑定'),
@@ -774,18 +785,19 @@ window.__ModuleLoader__.load({
             h('strong', null, `飞书长连接：${project.feishuConnection?.label || '状态未知'}`),
             h('div', { style: { marginTop: 5 } }, 'Host 使用飞书官方 Node.js SDK 建立 WebSocket 长连接，无需公网回调。开放平台需启用机器人能力、订阅 im.message.receive_v1 和卡片按钮回调 card.action.trigger、申请并审批 im:message.p2p_msg:readonly（读取单聊消息）及 im:message:send_as_bot（发送文本和文件），并发布应用版本后配置才生效。'),
             h('div', { className: 'ph-muted', role: 'status', style: { marginTop: 5 } }, (() => { const d = project.feishuConnection?.inboundDiagnostics; return d ? `入站诊断（不记录消息内容）：已收 ${d.receivedCount} 条；最近 ${d.lastAt ? new Date(d.lastAt).toLocaleString() : '暂无'}；类型 ${d.lastType || '—'}；结果 ${d.lastOutcome || '—'}；SDK 拒绝 ${d.rejectedCount || 0}（${d.lastRejectReason || '—'}）；分发错误 ${d.dispatcherErrorCount || 0}（${d.lastDispatcherErrorCode || '—'}）` : '入站诊断需更新并重启 Host 后显示' })()),
-            h('div', { className: 'ph-muted', role: 'status', style: { marginTop: 5 } }, (() => { const d = project.feishuConnection?.replyDiagnostics; return d ? `助手回传诊断：已发送 ${d.sentCount} 次；失败 ${d.failedCount} 次；待处理 ${d.pendingCount}；最近结果 ${d.lastOutcome || '—'}${d.lastErrorCode ? `（${d.lastErrorCode}）` : ''}` : '助手回传诊断需更新并重启 Host 后显示' })()),
+            h('div', { className: 'ph-muted', role: 'status', style: { marginTop: 5 } }, (() => { const d = project.feishuConnection?.replyDiagnostics; return d ? `助手回传诊断：已发送 ${d.sentCount} 次；失败 ${d.failedCount} 次；待处理 ${d.pendingCount}；待人工核对 ${d.uncertainCount || 0}；最近结果 ${d.lastOutcome || '—'}${d.lastErrorCode ? `（${d.lastErrorCode}）` : ''}` : '助手回传诊断需更新并重启 Host 后显示' })()),
             h('button', { type: 'button', className: 'ph-btn small', style: { marginTop: 8 }, onClick: refreshFeishuStatus }, '刷新连接状态')
           ),
           h('div', { className: 'ph-notice' },
             h('strong', null, `项目助手会话：${project.assistantSessionId || '尚未绑定'}`),
-            h('div', { style: { marginTop: 5 } }, '同一个飞书私聊可通过不同项目的一次性配对码授权多个 DSH 项目助手；每条私聊仅限配对用户使用。配对后会出现“选择项目助手”卡片，直接点击项目按钮切换，卡片会显示当前项目；也可发送 /项目列表 重新显示卡片。文本送入当前助手；收到的文件保存到该项目 files/ 目录；用户明确要求时，助手也可将 files/ 内生成的文件发送到已绑定飞书私聊（单个不超过 20 MiB）。群聊、历史消息、文档和表格读取暂不开放；配对码 5 分钟有效，请勿转发。'),
+            h('div', { style: { marginTop: 5 } }, '同一个飞书私聊可通过不同项目的一次性配对码授权多个 DSH 项目助手；每条私聊仅限配对用户使用。绑定后不会主动推送项目选择卡片；需要切换时发送 /切换会话 或 /项目列表 主动显示/更新卡片，也可发送 /切换 <序号> 直接切换。卡片会显示当前项目。文本送入当前助手；收到的文件保存到该项目 files/ 目录；用户明确要求时，助手也可将 files/ 内生成的文件发送到已绑定飞书私聊（单个不超过 20 MiB）。群聊、历史消息、文档和表格读取暂不开放；配对码 5 分钟有效，请勿转发。'),
             feishuPairing.state === 'waiting' && h('p', { role: 'status' }, `请在飞书机器人私聊中发送配对码：${feishuPairing.code}`),
             feishuPairing.state === 'bound' && h('p', { role: 'status' }, `已绑定飞书私聊：${feishuPairing.active ? '当前选中此项目' : '当前选中其他项目'}；飞书记录共用一个私聊窗口。`),
             feishuPairing.state === 'bound' && h('label', { className: 'ph-muted', style: { display: 'flex', gap: 8, alignItems: 'flex-start', marginTop: 8 } },
               h('input', { type: 'checkbox', 'aria-label': '同步对话到飞书', checked: feishuPairing.syncMessages === true, disabled: feishuPairingBusy, onChange: setFeishuMessageSync }),
               '开启后，会把 DSH 或企微来源的用户消息及助手可见答复镜像到飞书并标注来源；飞书发起的对话只在原聊天回复。关闭则不镜像；DSH 会话始终不加来源标签，后台上下文和推理内容不会转发。'
             ),
+            feishuPairing.state === 'bound' && h('p', { className: 'ph-muted', style: { marginTop: 8 } }, '已配对会话会在 DSH Host 运行时自动恢复；收到飞书私聊后无需手动打开 DSH 会话窗口。恢复使用 DSH 当前可用的 Agent 配置，不保证还原原会话专属模型、工具或提示配置。'),
             feishuPairing.state === 'bound-elsewhere' && h('p', { role: 'status' }, '此工作区已绑定飞书单聊，绑定归属于另一个 DSH 会话；账号信息不会在此显示。'),
             feishuPairing.state === 'bound-elsewhere' && feishuPairing.ownerSessionId && h('button', { type: 'button', className: 'ph-btn small', onClick: () => onOpenSession?.(feishuPairing.ownerSessionId) }, '打开已配对的 DSH 会话'),
             feishuPairing.state === 'error' && h('p', { role: 'alert' }, feishuPairing.label),
@@ -804,9 +816,10 @@ window.__ModuleLoader__.load({
 
       return h('div', { className: 'ph-root' },
         h('main', { className: 'ph-main' }, project ? h(React.Fragment, null,
-          h('header', { className: 'ph-top' }, h('div', { className: 'ph-title-row' }, h('div', null, h('h1', { className: 'ph-title' }, project.name), h('div', { className: 'ph-path' }, project.path === '.' ? 'Workspace 根目录' : project.path)), h('span', { className: 'ph-badge' }, `${project.tasks.filter((task) => task.status === 'done').length}/${project.tasks.length} 完成`), h('span', { className: 'ph-badge' }, `${project.progress}%`), needsWorkspaceNormalization && h('button', { className: 'ph-btn small', disabled: normalizing, onClick: normalizeCurrentWorkspace }, normalizing ? '迁移中…' : '规范化目录')),
+          h('header', { className: 'ph-top' }, h('div', { className: 'ph-title-row' }, h('div', null, h('h1', { className: 'ph-title' }, project.name), h('div', { className: 'ph-path' }, project.path === '.' ? 'Workspace 根目录' : project.path)), h('span', { className: 'ph-badge' }, `${project.tasks.filter((task) => task.status === 'done').length}/${project.tasks.length} 完成`), h('span', { className: 'ph-badge' }, `${project.progress}%`), needsWorkspaceNormalization && h('button', { className: 'ph-btn small', disabled: normalizing, onClick: normalizeCurrentWorkspace }, normalizing ? '迁移中…' : '迁移项目目录')),
             h('nav', { className: 'ph-tabs' }, [['overview', '概览'], ['tasks', '任务'], ['gantt', '甘特'], ['files', '项目文件'], ['integrations', '办公集成']].map(([key, label]) => h('button', { key, type: 'button', 'aria-pressed': tab === key, className: `ph-tab ${tab === key ? 'active' : ''}`, onClick: () => setTab(key) }, label)))),
           error && h('div', { className: 'ph-error', role: 'alert' }, error),
+          (project.path !== '.' || !project.workspaceId || !project.assistantSessionId) && h('div', { className: 'ph-warning', role: 'status' }, h('span', null, '该项目尚未完整绑定到当前 Workspace 根目录。打开面板不会自动迁移；确认后可迁移/修复项目资料，旧来源文件将保留。'), h('button', { type: 'button', className: 'ph-btn small primary', disabled: initializing || !workspaceId, onClick: initializeCurrentWorkspace }, initializing ? '处理中…' : '迁移/修复项目资料')),
           h('div', { className: 'ph-toolbar' }, tab === 'tasks' && h('button', { className: 'ph-btn primary', onClick: () => setShowTaskInput((v) => !v) }, '+ 新建任务'), tab === 'gantt' && h('span', { className: 'ph-toolbar-label' }, '自动适配项目周期 · 可拖动任务条改日期 · 允许并行交叉'), tab === 'files' && h('span', { className: 'ph-toolbar-label' }, '选择项目文件后可作为附件发送给项目助手'), h('span', { className: 'ph-spacer' }), tab !== 'files' && h('span', { className: 'ph-toolbar-label' }, `${tab === 'tasks' ? boardTasks.length : project.tasks.length} 个任务`)), 
           h('section', { className: 'ph-content' },
             tab === 'overview' ? h(ProjectOverview, { project, onUpdate: updateProject, onError: setError, onPatchTask: updateOverviewTask, onEditTask: openEditor }) : null,
@@ -818,15 +831,10 @@ window.__ModuleLoader__.load({
               : null,
             tab === 'gantt' ? h(Gantt, { project, onEdit: openEditor, onPatch: patchTask, onError: setError }) : null),
           editing && h(TaskEditor, { task: editing, onClose: () => setEditing(null), onSave: saveEditor, onAddNode: addTaskNode, onError: setError }))
-          : h('div', { className: 'ph-empty', style: { margin: 'auto' } }, loading ? '正在读取项目…' : h(React.Fragment, null, h('h2', null, '当前工作区尚未初始化为项目'), h('p', null, '在 DSH 中新增工作区即创建项目；进入该工作区后，Project Hub 会自动初始化项目资料。')))))
+          : h('div', { className: 'ph-empty', style: { margin: 'auto' } }, loading ? '正在读取项目…' : h(React.Fragment, null, h('h2', null, '当前工作区尚未初始化为项目'), h('p', null, '只有点击下方按钮后，Project Hub 才会在当前 Workspace 创建项目资料；不会自动创建 DSH 会话。'), h('button', { type: 'button', className: 'ph-btn primary', disabled: initializing || !workspaceId, onClick: initializeCurrentWorkspace }, initializing ? '初始化中…' : '初始化当前 Workspace 项目')))))
     }
 
     function apply(ctx) {
-      const pendingWorkspaces = new Set()
-      const pendingWorkspacePaths = new Set()
-      const initializedWorkspaces = new Set()
-      const syncingWorkspaces = new Set()
-      const directoryPathKey = (path) => String(path || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
       const randomSuffix = () => (globalThis.crypto?.randomUUID?.() || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`).replace(/-/g, '').slice(0, 8).toLowerCase()
       const safeWorkspaceTitle = (value) => {
         const name = String(value || '').trim()
@@ -855,13 +863,6 @@ window.__ModuleLoader__.load({
           throw error
         }
       }
-      const sendProjectWelcome = async (sessionId, projectName, project) => {
-        const name = String(projectName || project?.name || '项目')
-        const projectFile = 'project.md'
-        const text = `你是「${name}」项目的项目助手，负责协助项目管理并回答项目相关问题。请以当前 Workspace 根目录的 ${projectFile} 和 files/ 的实际内容为准；新 Workspace 初次创建时，project.md 可能只有空白模板，files/ 也可能为空。需要依赖项目背景时，先查阅这些位置的实际内容。不要根据项目名称臆测目标、范围、成员、时间、交付物或任务，也不要声称已读到并不存在的项目背景。若资料尚未提供，首次回应简短说明目前没有项目背景，并邀请用户按需提供目标、交付物、期限或约束；不要一次性盘问或自动填充资料。任务仅使用待办、进行中、有阻塞、完成四种状态，不再创建阶段或里程碑分类。仅在用户明确要求时才更新项目资料、创建/修改任务或追加任务节点；用户明确要求记录完成事项、当前事项或阻塞卡点时，使用 project_hub_manage 的 add_task_node，完成时间由 Host 自动记录。用户明确要求把文件发到当前飞书或企微私聊时，先把输出保存在 files/ 下，再调用 project_hub_manage 的 send_file 操作发送相对 files/ 的路径；如果未指定发送平台且无法判断当前入站平台，先询问，不得猜测接收人。`
-        const result = await ctx.sessions.using(sessionId, { source: 'projectHubWelcome' }, (reference) => reference.binding.session.prompt([{ type: 'text', text }], 'queue'))
-        if (!result?.ok) throw new Error(result?.error?.message || '项目助手欢迎指令未能发送')
-      }
       const sendProjectFiles = async (currentSessionId, project, paths) => {
         if (!project?.assistantSessionId) throw new Error('项目尚未绑定项目助手 Session')
         const assistantSessionId = project.assistantSessionId
@@ -884,78 +885,6 @@ window.__ModuleLoader__.load({
         const result = await ctx.sessions.using(assistantSessionId, { source: 'projectHubFileSelection' }, (reference) => reference.binding.session.prompt(content, 'queue'))
         if (!result?.ok) throw new Error(result?.error?.message || '项目文件未能发送给项目助手')
       }
-      const ensureProjectForWorkspace = async (workspace) => {
-        const workspaceId = workspace?.workspaceId || workspace?.id
-        const sessionIds = Array.isArray(workspace?.sessionIds) ? workspace.sessionIds : []
-        if (!workspaceId || pendingWorkspacePaths.has(directoryPathKey(workspace.path)) || initializedWorkspaces.has(workspaceId) || pendingWorkspaces.has(workspaceId) || syncingWorkspaces.has(workspaceId)) return
-        syncingWorkspaces.add(workspaceId)
-        let lastError
-        let bindingSessionId = ''
-        let bindingSessionActive = false
-        let bindingProject
-        try {
-          for (const sessionId of sessionIds) {
-            try {
-              const binding = await request(API, { method: 'POST', body: JSON.stringify({ action: 'project.binding', sessionId }) })
-              bindingSessionId = sessionId
-              bindingSessionActive = binding.sessionActive === true
-              bindingProject = binding.project
-              lastError = undefined
-              break
-            } catch (error) { lastError = error }
-          }
-          if (bindingProject?.assistantSessionId) {
-            if (bindingProject.workspaceId === workspaceId) {
-              if (bindingSessionActive) await request(API, { method: 'POST', body: JSON.stringify({ action: 'project.ensure', workspaceId, sessionId: bindingSessionId, name: workspace.title }) })
-              await ensureProjectFilesDirectory(workspace.path)
-              initializedWorkspaces.add(workspaceId)
-              return
-            }
-            if (!bindingProject.workspaceId && bindingSessionId && bindingSessionActive) {
-              const ensured = await request(API, { method: 'POST', body: JSON.stringify({ action: 'project.ensure', workspaceId, sessionId: bindingSessionId, name: workspace.title }) })
-              await ensureProjectFilesDirectory(workspace.path, ensured.project.id)
-              initializedWorkspaces.add(workspaceId)
-              return
-            }
-          }
-          if (lastError && !(lastError.status === 403 && lastError.message.includes('DSH 会话尚未激活'))) {
-            console.warn('Project Hub could not inspect this workspace yet:', lastError)
-            return
-          }
-          const directoryName = String(workspace.path || '').replace(/[\\/]+$/, '').split(/[\\/]/).at(-1) || ''
-          if (workspace.title !== directoryName) {
-            console.warn(`Project Hub did not initialize Workspace ${workspaceId}: title "${workspace.title}" must exactly match root directory "${directoryName}".`)
-            return
-          }
-          const duplicateWorkspace = ctx.workspaces.list.getSnapshot().items.find((candidate) => (candidate.workspaceId || candidate.id) !== workspaceId && String(candidate.title || '').trim().toLocaleLowerCase() === String(workspace.title || '').trim().toLocaleLowerCase())
-          if (duplicateWorkspace) {
-            console.warn(`Project Hub did not initialize Workspace ${workspaceId}: another Workspace is already named "${workspace.title}".`)
-            return
-          }
-          let sessionId
-          try {
-            sessionId = await ctx.sessions.create({ workspaceId })
-            try { unwrapRemote(await ctx.remote.session.rename({ sessionId, title: `${workspace.title || '项目'} · 项目助手` })) }
-            catch (error) { console.warn('Project Hub could not rename the default Session:', error) }
-            const ensured = await request(API, { method: 'POST', body: JSON.stringify({ action: 'project.ensure', workspaceId, sessionId, name: workspace.title }) })
-            await ensureProjectFilesDirectory(workspace.path, ensured.project.id)
-            try { await sendProjectWelcome(sessionId, workspace.title, ensured.project) }
-            catch (error) { console.warn('Project Hub could not send the default assistant welcome prompt:', error) }
-            initializedWorkspaces.add(workspaceId)
-            return
-          } catch (error) { lastError = error }
-          if (lastError) console.warn('Project Hub could not initialize this workspace yet:', lastError)
-        } finally { syncingWorkspaces.delete(workspaceId) }
-      }
-      const syncWorkspaces = () => {
-        const snapshot = ctx.workspaces.list.getSnapshot()
-        if (snapshot.phase !== 'ready') return
-        for (const workspace of snapshot.items) void ensureProjectForWorkspace(workspace)
-      }
-      const unsubscribeWorkspaces = ctx.workspaces.list.subscribe(syncWorkspaces)
-      ctx.effect(() => () => unsubscribeWorkspaces(), 'project-hub: synchronize workspaces')
-      syncWorkspaces()
-
       const normalizeWorkspaceDirectory = async (currentSessionId, displayedProject, workspacePath, workspaceTitle) => {
         const workspace = ctx.workspaces.list.getSnapshot().items.find((candidate) => candidate.sessionIds?.includes(currentSessionId))
         const workspaceId = workspace?.workspaceId || workspace?.id
@@ -981,17 +910,13 @@ window.__ModuleLoader__.load({
         let newSessionId = ''
         let newPath = ''
         let dataCopied = false
-        pendingWorkspaces.add(workspaceId)
         try {
           unwrapRemote(await ctx.remote.workspace.rename({ workspaceId, title: temporaryTitle }))
           oldRenamed = true
           newPath = unwrapRemote(await ctx.remote.directoryPicker.createDirectory(parentPath, title))
-          pendingWorkspacePaths.add(directoryPathKey(newPath))
           const created = unwrapRemote(await ctx.remote.workspace.create({ path: newPath }))
           newWorkspaceId = created.workspace?.workspaceId || created.workspace?.id
           if (!newWorkspaceId) throw new Error('DSH 未返回新 Workspace ID')
-          pendingWorkspaces.add(newWorkspaceId)
-          pendingWorkspacePaths.delete(directoryPathKey(newPath))
           unwrapRemote(await ctx.remote.workspace.rename({ workspaceId: newWorkspaceId, title }))
           newSessionId = await ctx.sessions.create({ workspaceId: newWorkspaceId })
           unwrapRemote(await ctx.remote.session.rename({ sessionId: newSessionId, title: `${title} · 项目助手` }))
@@ -1023,36 +948,32 @@ window.__ModuleLoader__.load({
             }
           }
           await ensureProjectFilesDirectory(newPath, newProject.id)
-          try { await sendProjectWelcome(newSessionId, title, newProject) }
-          catch (error) { console.warn('Project Hub could not send the migrated project welcome prompt:', error) }
           dataCopied = true
-          initializedWorkspaces.add(newWorkspaceId)
           ctx.uiWorkspace.openSession(newSessionId)
-          try { unwrapRemote(await ctx.remote.workspace.delete({ workspaceId })) }
-          catch (error) { throw new Error(`新项目已迁移至 ${newPath}，但旧 Workspace 注销失败（旧标题：${temporaryTitle}）：${error.message}`) }
-          initializedWorkspaces.delete(workspaceId)
           return newProject
         } catch (error) {
-          pendingWorkspacePaths.delete(directoryPathKey(newPath))
           if (!dataCopied) {
             if (newWorkspaceId) {
               try { unwrapRemote(await ctx.remote.workspace.delete({ workspaceId: newWorkspaceId })) } catch {}
-              initializedWorkspaces.delete(newWorkspaceId)
             }
             if (oldRenamed) {
               try { unwrapRemote(await ctx.remote.workspace.rename({ workspaceId, title })) } catch {}
             }
           }
           throw new Error(`${dataCopied ? '项目内容已复制到新目录，但迁移未完全结束' : '目录规范化未完成，旧项目仍保留'}：${error.message}${newPath ? `（新目录：${newPath}）` : ''}`)
-        } finally {
-          pendingWorkspaces.delete(workspaceId)
-          if (newWorkspaceId) pendingWorkspaces.delete(newWorkspaceId)
         }
       }
 
+      const initializeWorkspaceProject = async ({ sessionId, workspaceId, workspacePath, workspaceTitle }) => {
+        const result = await request(API, { method: 'POST', body: JSON.stringify({ action: 'project.ensure', sessionId, workspaceId, name: workspaceTitle }) })
+        if (workspacePath) await ensureProjectFilesDirectory(workspacePath)
+        const refreshed = await request(`${API}?sessionId=${encodeURIComponent(sessionId)}`)
+        return refreshed.project || result.project
+      }
       const View = ({ sessionId }) => {
         const workspace = ctx.workspaces.list.getSnapshot().items.find((candidate) => candidate.sessionIds?.includes(sessionId))
-        return h(ProjectManagementView, { sessionId, workspacePath: workspace?.path || '', workspaceTitle: workspace?.title || '', onOpenSession: (assistantSessionId) => ctx.uiWorkspace.openSession(assistantSessionId), onSendFiles: (currentSessionId, project, paths) => sendProjectFiles(currentSessionId, project, paths), onEnsureFiles: ensureProjectFilesDirectory, onNormalizeWorkspace: (currentSessionId, project, path, title) => normalizeWorkspaceDirectory(currentSessionId, project, path, title) })
+        const workspaceId = workspace?.workspaceId || workspace?.id || ''
+        return h(ProjectManagementView, { sessionId, workspaceId, workspacePath: workspace?.path || '', workspaceTitle: workspace?.title || '', onOpenSession: (assistantSessionId) => ctx.uiWorkspace.openSession(assistantSessionId), onInitializeWorkspace: initializeWorkspaceProject, onSendFiles: (currentSessionId, project, paths) => sendProjectFiles(currentSessionId, project, paths), onEnsureFiles: ensureProjectFilesDirectory, onNormalizeWorkspace: (currentSessionId, project, path, title) => normalizeWorkspaceDirectory(currentSessionId, project, path, title) })
       }
       ctx.slots.inject('conversation.view', () => ctx.slots.register({ name: 'conversation.view', id: PANEL_ID, order: 20, label: () => '项目', inject: (sessionId) => ({ sessionId }) }, View))
     }

@@ -19,6 +19,7 @@ function createKeyringEntry(service, account) {
 }
 
 const ROUTE = '/api/project-hub'
+const INTEGRATION_AGENT_ACTIONS = new Set(['list_project_files', 'wecom_send_text', 'wecom_status', 'feishu_status', 'feishu_send_test', 'send_file'])
 const ROOT = 'projects' // legacy layout, retained only for safe migration
 const PROJECT_FILE = 'project.md'
 const TASKS_DIR = 'tasks'
@@ -41,6 +42,11 @@ const FEISHU_BINDING_ACCOUNT = 'feishu-user-binding'
 const FEISHU_PAIRING_TTL_MS = 5 * 60 * 1000
 const FEISHU_SEEN_LIMIT = 5000
 const FEISHU_PENDING_LIMIT = 100
+const BRIDGE_JOURNAL_FILE = '.project-hub-bridge-state.json'
+const BRIDGE_JOURNAL_VERSION = 1
+const BRIDGE_JOURNAL_MAX_BYTES = 4 * 1024 * 1024
+const BRIDGE_EVENT_TTL_MS = 24 * 60 * 60 * 1000
+const FEISHU_OUTBOX_LIMIT = 50
 const INBOUND_FILE_MAX_BYTES = 50 * 1024 * 1024
 const INBOUND_FILE_COUNT_LIMIT = 5
 const INBOUND_MESSAGE_FILE_MAX_BYTES = 100 * 1024 * 1024
@@ -96,6 +102,12 @@ function json(data, status = 200) {
 function fail(message, status = 400) {
   const error = new Error(message)
   error.status = status
+  throw error
+}
+function failWithCode(message, status, code) {
+  const error = new Error(message)
+  error.status = status
+  error.code = code
   throw error
 }
 function safeText(value, label, max = 200) {
@@ -188,6 +200,40 @@ function normalizeTaskNodes(value) {
     return [normalized]
   })
 }
+function emptyBridgeJournal() {
+  return { version: BRIDGE_JOURNAL_VERSION, updatedAt: new Date().toISOString(), seen: { wecom: [], feishu: [] }, feishuPending: [], feishuOutbox: [] }
+}
+function parseBridgeJournal(encoded) {
+  if (typeof encoded !== 'string' || Buffer.byteLength(encoded, 'utf8') > BRIDGE_JOURNAL_MAX_BYTES) throw new Error('Project Hub bridge journal exceeds its size limit')
+  let value
+  try { value = JSON.parse(encoded) } catch { throw new Error('Project Hub bridge journal is corrupt') }
+  if (!value || value.version !== BRIDGE_JOURNAL_VERSION || !value.seen || !Array.isArray(value.seen.wecom) || !Array.isArray(value.seen.feishu) || !Array.isArray(value.feishuOutbox)) throw new Error('Project Hub bridge journal schema is unsupported')
+  const normalizeSeen = (entries) => entries.filter((entry) => entry && typeof entry.key === 'string' && entry.key.length <= 512 && Number.isFinite(entry.at)).map((entry) => ({ key: entry.key, at: entry.at })).slice(-FEISHU_SEEN_LIMIT)
+  const feishuOutbox = value.feishuOutbox.filter((record) => record && typeof record.id === 'string' && record.id.length <= 256 && typeof record.sessionId === 'string' && typeof record.chatId === 'string' && typeof record.openId === 'string' && typeof record.replyToMessageId === 'string' && typeof record.output === 'string' && ['queued', 'sending', 'uncertain'].includes(record.status)).map((record) => ({ id: record.id, sessionId: record.sessionId, ...(typeof record.dshMessageId === 'string' ? { dshMessageId: record.dshMessageId.slice(0, 256) } : {}), chatId: record.chatId, openId: record.openId, replyToMessageId: record.replyToMessageId, output: record.output.slice(0, 19000), status: record.status, attempts: Number.isSafeInteger(record.attempts) && record.attempts >= 0 ? record.attempts : 0, createdAt: typeof record.createdAt === 'string' ? record.createdAt : new Date().toISOString(), lastErrorCode: typeof record.lastErrorCode === 'string' ? record.lastErrorCode.slice(0, 48) : '' })).slice(-FEISHU_OUTBOX_LIMIT)
+  const pendingSource = Array.isArray(value.feishuPending) ? value.feishuPending : []
+  const feishuPending = pendingSource.filter((record) => record && typeof record.id === 'string' && record.id.length <= 256 && typeof record.sessionId === 'string' && typeof record.eventKey === 'string' && typeof record.chatId === 'string' && typeof record.openId === 'string' && typeof record.replyToMessageId === 'string' && typeof record.output === 'string' && ['pending', 'running', 'completed', 'sent'].includes(record.status)).map((record) => ({ id: record.id, sessionId: record.sessionId, eventKey: record.eventKey.slice(0, 512), chatId: record.chatId, openId: record.openId, replyToMessageId: record.replyToMessageId, output: record.output.slice(0, 19000), status: record.status, ...(Number.isSafeInteger(record.turn) ? { turn: record.turn } : {}), createdAt: typeof record.createdAt === 'string' ? record.createdAt : new Date().toISOString() })).slice(-FEISHU_PENDING_LIMIT)
+  return { version: BRIDGE_JOURNAL_VERSION, updatedAt: typeof value.updatedAt === 'string' ? value.updatedAt : '', seen: { wecom: normalizeSeen(value.seen.wecom), feishu: normalizeSeen(value.seen.feishu) }, feishuPending, feishuOutbox }
+}
+function bridgeJournalStageError(error, stage) {
+  const wrapped = new Error(error instanceof Error ? error.message : String(error), { cause: error })
+  if (typeof error?.code === 'string') wrapped.code = error.code
+  if (Number.isSafeInteger(error?.status)) wrapped.status = error.status
+  wrapped.bridgeJournalStage = stage
+  return wrapped
+}
+function bridgeJournalErrorCode(error) {
+  if (typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]{0,47}$/.test(error.code)) return error.code
+  if (Number.isSafeInteger(error?.status)) return `HOST_${error.status}`
+  if (error?.name === 'SyntaxError') return 'SYNTAX_ERROR'
+  return typeof error?.name === 'string' && /^[A-Za-z][A-Za-z0-9]{0,39}$/.test(error.name) ? error.name : 'UNKNOWN'
+}
+function bridgeJournalClaimFailureNotice(error) {
+  if (error?.code === 'SESSION_AUTO_RESUME_FAILED') return 'DSH 未能自动恢复绑定的项目助手会话，消息未送入 DSH；请在 DSH 打开对应助手会话后重发。'
+  if (error?.code === 'SESSION_AGENT_NOT_ACTIVE') return '绑定的 DSH 会话存在，但对应 Agent 当前不可用，消息未送入 DSH；请打开该助手会话后重发。'
+  if (error?.code === 'SESSION_NOT_ACTIVE') return '绑定的 DSH 项目助手会话当前未激活，消息未送入 DSH；请在 DSH 打开对应助手会话后重发。'
+  if (typeof error?.code === 'string' && error.code.startsWith('SESSION_')) return '绑定的 DSH 会话与工作区信息不匹配，消息未送入 DSH；请在 Project Hub 重新绑定项目助手会话后重试。'
+  return '当前无法安全记录消息去重状态，消息未送入 DSH；请稍后重发。'
+}
 function pickPatch(value, allowed, label) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail(`${label} patch 格式无效`)
   const unknown = Object.keys(value).filter((key) => !allowed.includes(key))
@@ -197,8 +243,16 @@ function pickPatch(value, allowed, label) {
 }
 
 class ProjectHub extends Service {
-  static inject = ['connection', 'fs', 'shell', 'sandboxPolicy', 'tools', 'workspaceRegistry', 'sessions', 'agents']
+  static inject = ['connection', 'fs', 'shell', 'sandboxPolicy', 'workspaceRegistry', 'sessions', 'sessionPersistence', 'agents']
   ensureProjects = new Map()
+  bridgeJournalQueues = new Map()
+  bridgeAutoResumeAttempts = new Map()
+  bridgeAgentToolDisposers = new Map()
+  projectAssistantSessions = new Set()
+  bridgeToolScopeActive = false
+  bridgeJournalDiagnostics = { lastFailure: null }
+  feishuDurableOutbox = new Map()
+  feishuOutboxRecoveryRunning = false
   wecomClient = null
   createWeComClient = (options) => new WeComAIBotClient(options)
   wecomStatus = { state: 'not-configured', label: '尚未配置智能机器人长连接' }
@@ -224,39 +278,119 @@ class ProjectHub extends Service {
   feishuMirrorTurnReplies = new Map()
   externalMessageOrigins = new Map()
   feishuInboundDiagnostics = { sequence: 0, receivedCount: 0, lastAt: null, lastType: null, lastOutcome: 'none', rejectedCount: 0, lastRejectAt: null, lastRejectReason: null, dispatcherErrorCount: 0, lastDispatcherErrorAt: null, lastDispatcherErrorCode: null }
-  feishuReplyDiagnostics = { pendingCount: 0, sentCount: 0, failedCount: 0, lastAt: null, lastOutcome: 'none', lastErrorCode: null }
+  feishuCardActionDiagnostics = { count: 0, lastAt: null, lastOutcome: 'none', selectedProject: null, activeProject: null, clickedCanonicalCard: null, oldCardRecall: null }
+  feishuReplyDiagnostics = { pendingCount: 0, sentCount: 0, failedCount: 0, uncertainCount: 0, lastAt: null, lastOutcome: 'none', lastErrorCode: null }
 
   constructor(ctx) {
     super(ctx, 'projectHub')
     this.root = ctx.sandboxPolicy.workspaceRoot
     ctx.on('session/event', (session, event) => this.handleSessionEvent(session, event))
+    ctx.on('agent/created', ({ agent }) => {
+      if (!this.bridgeToolScopeActive) return
+      const sessionId = agent?.session?.id || agent?.id
+      if (sessionId && this.projectAssistantSessions.has(sessionId)) {
+        try { this.ensureProjectHubAgentTools(agent) }
+        catch (error) { this.ctx.logger.warn(`project-hub: could not attach the scoped assistant tool (${bridgeJournalErrorCode(error)})`) }
+        return
+      }
+      void this.attachProjectHubToolIfOwned(agent).catch((error) => this.ctx.logger.warn(`project-hub: could not attach the scoped assistant tool (${bridgeJournalErrorCode(error)})`))
+    })
     ctx.effect(() => ctx.connection.fetch.register({
       path: ROUTE,
       methods: ['GET', 'POST'],
       requestBody: 'buffered',
       fetch: (request) => this.handleScoped(request)
     }), 'project-hub: api route')
-    ctx.effect(() => ctx.tools.register(defineTool({
-      name: 'project_hub_manage',
-      description: '只能访问调用此工具的 DSH 会话所属工作区对应的唯一 Project Hub 项目。任务只使用待办、进行中、有阻塞、完成四种状态；阶段和里程碑不再使用。用户明确要求时才创建/修改任务、记录任务节点或发送文件。add_task_node 用于追加完成事项、当前事项或阻塞卡点，完成时间由 Host 记录。企业微信使用智能机器人 API 长连接；飞书使用官方长连接并仅接受已绑定的单聊。send_file 只发送当前项目 Workspace 下 files/ 目录内的文件到本项目已绑定的平台私聊；不接受任何目标 ID，不可用于群发。禁止删除和猜测日期。',
+    ctx.effect(() => {
+      this.bridgeToolScopeActive = true
+      void this.attachProjectHubToolsToLiveAgents().catch((error) => this.ctx.logger.warn(`project-hub: could not restore scoped assistant tools (${bridgeJournalErrorCode(error)})`))
+      return () => {
+        this.bridgeToolScopeActive = false
+        this.disposeBridgeAgentTools()
+        this.projectAssistantSessions.clear()
+      }
+    }, 'project-hub: scoped assistant tools')
+    ctx.effect(() => this.startWeComConnection(), 'project-hub: wecom ai bot long connection')
+    ctx.effect(() => this.startFeishuConnection(), 'project-hub: feishu official long connection')
+  }
+
+  createIntegrationToolDefinition() {
+    return defineTool({
+      name: 'project_hub_integrations',
+      description: '飞书/企业微信集成工具：查看连接状态、发送企微文本、发送飞书测试消息，以及在明确请求时列出/发送当前项目 files/ 中的文件。项目和任务仍由 Project Hub 面板管理；此工具不修改项目或任务。仅向已绑定私聊发送；禁止群发。',
       parameters: {
-        action: { type: 'string', required: true, enum: ['list_projects', 'get_project', 'update_project', 'create_task', 'update_task', 'add_task_node', 'wecom_send_text', 'wecom_status', 'feishu_status', 'feishu_send_test', 'send_file'], description: '操作类型。add_task_node 只追加任务节点；send_file 仅在用户明确要求发送时调用。' },
-        taskId: { type: 'string', description: 'get_project 返回的当前工作区任务 ID。' },
-        title: { type: 'string', description: 'create_task 新任务的标题。' },
-        kind: { type: 'string', enum: ['completed', 'current', 'blocker'], description: '仅 add_task_node 使用：completed=记录已完成事项和时间，current=更新当前事项，blocker=记录阻塞卡点并将任务设为有阻塞。' },
-        path: { type: 'string', description: '仅 send_file 使用：当前项目文件路径，如 files/reports/status.pptx（也可写成 reports/status.pptx）；必须位于 files/ 下，不得使用绝对路径或 ..。' },
-        nodeText: { type: 'string', description: '仅 add_task_node 使用：节点说明，最多 2000 字符。' },
-        platform: { type: 'string', enum: ['feishu', 'wecom'], description: 'send_file 可选。用户明确指定飞书或企微时填写；从某平台私聊发起且用户说“发给我/发到这里”时省略，由 Host 按本轮入站平台确定。' },
+        action: { type: 'string', required: true, enum: ['list_project_files', 'wecom_send_text', 'wecom_status', 'feishu_status', 'feishu_send_test', 'send_file'], description: '仅限飞书/企微连接与发送操作；不包含项目或任务管理。' },
+        path: { type: 'string', description: 'list_project_files 可选目录（相对于 files/）；send_file 必须是 files/ 下的精确相对文件路径，如 reports/status.pptx。不得使用绝对路径或 ..。' },
+        platform: { type: 'string', enum: ['feishu', 'wecom'], description: 'send_file 可选。用户明确指定平台时填写；从平台私聊发起且用户说“发给我/发到这里”时省略，由 Host 按本轮入站平台确定。' },
         recipient: { type: 'string', description: '仅 wecom_send_text 使用：单聊 UserID 或已授权群聊 chatid；不接受 @all。send_file 不接受 recipient。' },
-        text: { type: 'string', description: '仅 wecom_send_text 使用：要发送的 Markdown 文本，最多 2048 字符。' },
-        patch: { type: 'json', description: '要更新的字段。项目支持 name、description、startDate、dueDate；任务支持 title、status、priority、start、due、progress、critical、assignees、relatedTo、checklist、body。阶段和里程碑已停用；节点请使用 add_task_node。' }
+        text: { type: 'string', description: '仅 wecom_send_text 使用：要发送的 Markdown 文本，最多 2048 字符。' }
       },
       output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
       execute: (args, exec) => this.executeAgentTool(args, exec.signal, exec.agent),
-      presentCall: (args) => ({ card: 'generic', title: 'Project Hub', kind: ['list_projects', 'get_project', 'wecom_status', 'feishu_status'].includes(args.action) ? 'read' : 'other', rawInput: args })
-    })), 'project-hub: assistant tool')
-    ctx.effect(() => this.startWeComConnection(), 'project-hub: wecom ai bot long connection')
-    ctx.effect(() => this.startFeishuConnection(), 'project-hub: feishu official long connection')
+      presentCall: (args) => ({ card: 'generic', title: '飞书 / 企业微信', kind: ['list_project_files', 'wecom_status', 'feishu_status'].includes(args.action) ? 'read' : 'other', rawInput: args })
+    })
+  }
+
+  async attachProjectHubToolIfOwned(agent) {
+    if (!this.bridgeToolScopeActive) return
+    const sessionId = agent?.session?.id || agent?.id
+    if (typeof sessionId !== 'string' || !sessionId) return
+    const workspaces = this.ctx.workspaceRegistry.list().filter((workspace) => workspace.sessionIds.includes(sessionId))
+    if (workspaces.length !== 1) return
+    const workspace = workspaces[0]
+    const projects = await this.listProjects(undefined, workspace.path)
+    if (projects.length !== 1) return
+    const project = await this.readProject(projects[0].id, undefined, workspace.path)
+    if (project.workspaceId !== workspace.id || project.assistantSessionId !== sessionId || project.path !== '.') return
+    if (!this.bridgeToolScopeActive) return
+    this.projectAssistantSessions.add(sessionId)
+    this.ensureProjectHubAgentTools(agent)
+  }
+
+  async attachProjectHubToolsToLiveAgents() {
+    const agents = this.ctx.agents?.list?.() || []
+    const results = await Promise.allSettled(agents.map((agent) => this.attachProjectHubToolIfOwned(agent)))
+    for (const result of results) if (result.status === 'rejected') this.ctx.logger.warn(`project-hub: skipped an Agent while restoring scoped tools (${bridgeJournalErrorCode(result.reason)})`)
+  }
+
+  attachProjectHubIntegrationToolToAgent(agent) {
+    const sessionId = agent?.session?.id || agent?.id
+    if (!this.bridgeToolScopeActive) throw new Error('Project Hub tool scope is closing')
+    if (typeof sessionId !== 'string' || !sessionId) throw new Error('cannot attach Project Hub tool to an unidentified Agent')
+    const registered = this.bridgeAgentToolDisposers.get(sessionId)
+    if (registered?.agent === agent) return
+    if (registered) this.detachBridgeAgentTool(sessionId)
+    const tools = agent?.ctx?.tools
+    if (typeof tools?.register !== 'function') throw new Error('resumed Agent tool scope is unavailable')
+    if (typeof tools.get === 'function' && tools.get('project_hub_integrations', agent)) return
+    const dispose = tools.register(this.createIntegrationToolDefinition())
+    this.bridgeAgentToolDisposers.set(sessionId, { agent, dispose })
+  }
+
+  ensureProjectHubAgentTools(agent, tools = agent?.ctx?.tools, { validatePreviousTools = false } = {}) {
+    if (typeof tools?.register !== 'function') throw new Error('Project Hub Agent tool scope is unavailable')
+    const previousTools = agent?.session?.requestHeader?.()?.tools || []
+    if (previousTools.some((tool) => tool.name === 'run_code') && !tools.get('run_code', agent)) {
+      if (typeof tools.presentAs !== 'function') throw new Error('resumed agent cannot restore its previous run_code presentation mode')
+      try { tools.presentAs('ptc') }
+      catch (error) { throw new Error('resumed agent could not restore its previous run_code presentation mode', { cause: error }) }
+    }
+    this.attachProjectHubIntegrationToolToAgent(agent)
+    if (validatePreviousTools) {
+      const unavailable = previousTools.map((tool) => tool.name).filter((name) => name && name !== 'project_hub_manage' && !tools.get(name, agent))
+      if (unavailable.length) throw new Error(`resumed agent is missing tools from its previous request: ${unavailable.join(', ')}`)
+    }
+  }
+
+  detachBridgeAgentTool(sessionId) {
+    const registration = this.bridgeAgentToolDisposers.get(sessionId)
+    if (!registration) return
+    try { registration.dispose() } catch (error) { this.ctx.logger.warn(`project-hub: failed to detach an Agent-scoped tool (${bridgeJournalErrorCode(error)})`) }
+    this.bridgeAgentToolDisposers.delete(sessionId)
+  }
+
+  disposeBridgeAgentTools() {
+    for (const sessionId of [...this.bridgeAgentToolDisposers.keys()]) this.detachBridgeAgentTool(sessionId)
   }
 
   async target(relativePath, workspaceRoot = this.root) {
@@ -274,6 +408,10 @@ class ProjectHub extends Service {
   }
 
   async assertProjectPath(relativePath, workspaceRoot, signal) {
+    if (relativePath === BRIDGE_JOURNAL_FILE) {
+      await this.assertEntryType(relativePath, 'file', workspaceRoot, { optional: true, signal })
+      return
+    }
     if (relativePath === PROJECT_FILE) {
       await this.assertEntryType(PROJECT_FILE, 'file', workspaceRoot, { optional: true, signal })
       return
@@ -327,6 +465,299 @@ class ProjectHub extends Service {
       return this.ctx.fs.writeText(target, content, { kind: 'replaceIfVersion', version: current.version }, signal, sandboxPolicy)
     }
     return this.ctx.fs.writeText(target, content, { kind: 'createIfAbsent' }, signal, sandboxPolicy)
+  }
+
+  async withBridgeJournal(sessionId, updater) {
+    let stage = 'workspace-session-lookup'
+    let workspace
+    try {
+      const binding = await this.workspaceForSession(sessionId)
+      workspace = binding.workspace
+      const { session } = binding
+      if (!session) {
+        stage = 'active-session-check'
+        fail('桥接状态只允许写入活动 DSH 工作区', 403)
+      }
+      const previous = this.bridgeJournalQueues.get(workspace.id) || Promise.resolve()
+      const operation = previous.catch(() => {}).then(async () => {
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          stage = 'journal-path-check'
+          await this.assertProjectPath(BRIDGE_JOURNAL_FILE, workspace.path)
+          stage = 'journal-target-resolution'
+          const target = await this.target(BRIDGE_JOURNAL_FILE, workspace.path)
+          stage = 'journal-stat'
+          const observed = await this.ctx.fs.stat(target)
+          let journal
+          if (observed) {
+            stage = 'journal-read'
+            const encoded = await this.ctx.fs.readText(target)
+            stage = 'journal-parse'
+            journal = parseBridgeJournal(encoded)
+          } else {
+            journal = emptyBridgeJournal()
+          }
+          stage = 'journal-update'
+          const response = updater(journal)
+          if (response?.write === false) return response.value === undefined ? journal : response.value
+          journal.updatedAt = new Date().toISOString()
+          stage = 'journal-serialize'
+          const encoded = JSON.stringify(journal)
+          if (Buffer.byteLength(encoded, 'utf8') > BRIDGE_JOURNAL_MAX_BYTES) fail('桥接状态超出持久化大小限制', 507)
+          stage = 'sandbox-policy'
+          const policy = this.ctx.sandboxPolicy.resolve({ session })
+          try {
+            stage = 'journal-write'
+            await this.ctx.fs.writeText(target, encoded, observed ? { kind: 'replaceIfVersion', version: observed.version } : { kind: 'createIfAbsent' }, undefined, policy)
+            return response?.value === undefined ? journal : response.value
+          } catch (error) {
+            if (attempt < 2 && ['FS_STALE_VERSION', 'FS_NOT_OBSERVED', 'FS_EXISTS'].includes(error?.code)) continue
+            throw error
+          }
+        }
+        stage = 'retry-exhausted'
+        fail('桥接状态并发更新冲突，请重试', 409)
+      })
+      this.bridgeJournalQueues.set(workspace.id, operation)
+      try { return await operation } finally { if (this.bridgeJournalQueues.get(workspace.id) === operation) this.bridgeJournalQueues.delete(workspace.id) }
+    } catch (error) {
+      throw bridgeJournalStageError(error, stage)
+    }
+  }
+
+  recordBridgeJournalFailure(platform, error) {
+    const stage = typeof error?.bridgeJournalStage === 'string' ? error.bridgeJournalStage : 'unknown'
+    const errorCode = bridgeJournalErrorCode(error)
+    this.bridgeJournalDiagnostics = { lastFailure: { at: new Date().toISOString(), platform, stage, errorCode } }
+    this.ctx.logger.warn(`project-hub: ${platform} bridge journal failed at ${stage} (${errorCode})`)
+  }
+
+  async readBridgeJournal(sessionId) {
+    return this.withBridgeJournal(sessionId, (journal) => ({ write: false, value: journal }))
+  }
+
+  bridgeAutoResumeFailure(message, cause) {
+    const error = new Error(message)
+    error.status = 503
+    error.code = 'SESSION_AUTO_RESUME_FAILED'
+    error.bridgeJournalStage = 'session-auto-resume'
+    if (cause instanceof Error) error.cause = cause
+    return error
+  }
+
+  async resumeBridgeSession(sessionId, platform, binding) {
+    const existingSession = this.ctx.sessions.get(sessionId)
+    const existingAgent = this.ctx.agents?.get(sessionId)
+    if (Boolean(existingSession) !== Boolean(existingAgent)) throw this.bridgeAutoResumeFailure('绑定会话的运行状态不一致；请在 DSH 打开对应助手会话后重试。')
+    const shouldResume = !existingSession && !existingAgent
+
+    let workspace
+    let project
+    try {
+      ({ workspace } = await this.workspaceForSession(sessionId, { requireActive: false }))
+      const projects = await this.listProjects(undefined, workspace.path)
+      if (projects.length !== 1) throw new Error('workspace must resolve to exactly one project')
+      project = await this.readProject(projects[0].id, undefined, workspace.path)
+      if (project.workspaceId !== workspace.id || project.assistantSessionId !== sessionId || project.path !== '.') throw new Error('bound assistant identity does not match a migrated, root-bound workspace project')
+      if (platform === 'feishu' && (binding.projectId !== project.id || binding.workspaceId !== workspace.id)) throw new Error('Feishu binding does not match the resolved workspace project')
+    } catch (cause) {
+      throw this.bridgeAutoResumeFailure('无法安全验证绑定的 DSH 工作区和项目；消息未送入 DSH。', cause)
+    }
+
+    if (!shouldResume) {
+      this.ensureProjectHubAgentTools(existingAgent)
+      return
+    }
+    const resumeRegistry = this.ctx.root?.agents || this.ctx.agents
+    if (typeof resumeRegistry?.resume !== 'function' || !this.ctx.sessionPersistence) throw this.bridgeAutoResumeFailure('当前 DSH Host 未提供会话自动恢复能力；请在 DSH 打开对应助手会话后重试。')
+
+    let handle
+    try {
+      handle = await resumeRegistry.resume({
+        resumeSessionId: sessionId,
+        setup: async (agentCtx, agent) => {
+          const cwd = agent?.session?.header?.cwd
+          if (agent?.session?.id !== sessionId || typeof cwd !== 'string' || !cwd) throw new Error('resumed agent identity or cwd is invalid')
+          const resolved = await this.ctx.workspaceRegistry.resolveByPath(cwd)
+          if (!resolved || resolved.id !== workspace.id || resolved.path !== workspace.path) throw new Error('resumed agent cwd does not match the bound workspace')
+          if (typeof agentCtx?.tools?.register !== 'function') throw new Error('resumed agent tool scope is unavailable')
+          this.ensureProjectHubAgentTools(agent, agentCtx.tools, { validatePreviousTools: true })
+        }
+      })
+    } catch (cause) {
+      this.detachBridgeAgentTool(sessionId)
+      // A UI activation may win the race. Reuse it only after both live registries agree.
+      if (this.ctx.sessions.get(sessionId) && this.ctx.agents?.get(sessionId)?.followup) {
+        this.ensureProjectHubAgentTools(this.ctx.agents.get(sessionId))
+        return
+      }
+      throw this.bridgeAutoResumeFailure('DSH 未能自动恢复绑定助手会话；消息未送入 DSH，请打开对应助手会话后重发。', cause)
+    }
+
+    const liveSession = this.ctx.sessions.get(sessionId)
+    const liveAgent = this.ctx.agents?.get(sessionId)
+    if (!handle || !liveSession || !liveAgent || typeof liveAgent.followup !== 'function') {
+      throw this.bridgeAutoResumeFailure('DSH 自动恢复后未能确认会话和 Agent 均已活动；消息未送入 DSH。')
+    }
+    try {
+      const { workspace: liveWorkspace, project: liveProject } = await this.projectForSession(sessionId)
+      if (liveWorkspace.id !== workspace.id || liveWorkspace.path !== workspace.path || liveProject.id !== project.id || liveProject.workspaceId !== workspace.id || liveProject.assistantSessionId !== sessionId) throw new Error('resumed session no longer matches its bound project')
+    } catch (cause) {
+      throw this.bridgeAutoResumeFailure('恢复后的会话工作目录或项目绑定不匹配；消息未送入 DSH。', cause)
+    }
+  }
+
+  async ensureBridgeSessionForInbound(sessionId, platform) {
+    const inFlight = this.bridgeAutoResumeAttempts.get(sessionId)
+    if (inFlight) return inFlight
+    const liveSession = this.ctx.sessions.get(sessionId)
+    if (liveSession) {
+      const liveAgent = this.ctx.agents?.get(sessionId)
+      if (liveAgent && typeof liveAgent.followup === 'function') return
+      const error = new Error('DSH 会话仍在运行，但对应 Agent 当前不可用；请打开该助手会话后重发。')
+      error.status = 503
+      error.code = 'SESSION_AGENT_NOT_ACTIVE'
+      error.bridgeJournalStage = 'agent-session-lookup'
+      throw error
+    }
+    let binding
+    try {
+      if (platform === 'wecom') {
+        binding = this.readStoredWeComBinding()
+        if (binding && binding.sessionId === sessionId) {
+          // A stored pairing is sufficient authorization for this exact assistant session.
+        } else {
+          const env = globalThis.process?.env || {}
+          const configuredSessionId = typeof env.WECOM_DSH_SESSION_ID === 'string' ? env.WECOM_DSH_SESSION_ID.trim() : ''
+          const allowedUsers = String(env.WECOM_ALLOWED_USER_IDS || '').split(',').map((value) => value.trim()).filter(Boolean)
+          if (configuredSessionId !== sessionId || !allowedUsers.length) return
+          binding = { sessionId }
+        }
+      } else if (platform === 'feishu') {
+        binding = this.readStoredFeishuBinding({ sessionId })
+        if (!binding) return
+      } else return
+    } catch (cause) {
+      throw this.bridgeAutoResumeFailure('无法核验绑定的自动恢复设置；消息未送入 DSH。', cause)
+    }
+    const pending = this.bridgeAutoResumeAttempts.get(sessionId)
+    if (pending) return pending
+    const operation = this.resumeBridgeSession(sessionId, platform, binding)
+    this.bridgeAutoResumeAttempts.set(sessionId, operation)
+    try { await operation } finally { if (this.bridgeAutoResumeAttempts.get(sessionId) === operation) this.bridgeAutoResumeAttempts.delete(sessionId) }
+  }
+
+  async restoreBoundBridgeSessions() {
+    const sessions = new Map()
+    try {
+      const binding = this.readStoredWeComBinding()
+      if (binding) sessions.set(binding.sessionId, { platform: 'wecom', binding })
+      else {
+        const env = globalThis.process?.env || {}
+        const sessionId = typeof env.WECOM_DSH_SESSION_ID === 'string' ? env.WECOM_DSH_SESSION_ID.trim() : ''
+        const users = String(env.WECOM_ALLOWED_USER_IDS || '').split(',').map((value) => value.trim()).filter(Boolean)
+        if (sessionId && users.length) sessions.set(sessionId, { platform: 'wecom', binding: { sessionId } })
+      }
+    } catch (error) {
+      this.ctx.logger.warn(`project-hub: could not read WeCom binding for session restore (${bridgeJournalErrorCode(error)})`)
+    }
+    try {
+      for (const conversation of this.readStoredFeishuConversations()) {
+        for (const binding of conversation.bindings) sessions.set(binding.sessionId, { platform: 'feishu', binding })
+      }
+    } catch (error) {
+      this.ctx.logger.warn(`project-hub: could not read Feishu bindings for session restore (${bridgeJournalErrorCode(error)})`)
+    }
+    await Promise.allSettled([...sessions].map(async ([sessionId, target]) => {
+      try { await this.ensureBridgeSessionForInbound(sessionId, target.platform) }
+      catch (error) { this.ctx.logger.warn(`project-hub: bound session restore failed (${bridgeJournalErrorCode(error)})`) }
+    }))
+  }
+
+  async claimBridgeEvent(sessionId, platform, key) {
+    if (!['wecom', 'feishu'].includes(platform) || typeof key !== 'string' || !key || key.length > 512) throw new Error('Invalid bridge event key')
+    await this.ensureBridgeSessionForInbound(sessionId, platform)
+    const now = Date.now()
+    let duplicate = false
+    await this.withBridgeJournal(sessionId, (journal) => {
+      const events = journal.seen[platform].filter((entry) => now - entry.at <= BRIDGE_EVENT_TTL_MS).slice(-FEISHU_SEEN_LIMIT)
+      duplicate = events.some((entry) => entry.key === key)
+      if (!duplicate) events.push({ key, at: now })
+      journal.seen[platform] = events.slice(-FEISHU_SEEN_LIMIT)
+      return { write: !duplicate, value: duplicate }
+    })
+    return duplicate
+  }
+
+  async releaseBridgeEvent(sessionId, platform, key) {
+    if (!['wecom', 'feishu'].includes(platform)) return
+    await this.withBridgeJournal(sessionId, (journal) => {
+      journal.seen[platform] = journal.seen[platform].filter((entry) => entry.key !== key)
+      return { write: true }
+    })
+  }
+
+  async writeFeishuOutbox(sessionId, record, { remove = false } = {}) {
+    const id = record.outboxId || `${sessionId}:${record.replyToMessageId}`
+    await this.withBridgeJournal(sessionId, (journal) => {
+      const index = journal.feishuOutbox.findIndex((entry) => entry.id === id)
+      if (remove) {
+        if (index >= 0) journal.feishuOutbox.splice(index, 1)
+      } else {
+        const safeRecord = {
+          id,
+          sessionId,
+          ...(typeof record.dshMessageId === 'string' ? { dshMessageId: record.dshMessageId.slice(0, 256) } : {}),
+          chatId: String(record.chatId || '').slice(0, 256),
+          openId: String(record.openId || '').slice(0, 256),
+          replyToMessageId: String(record.replyToMessageId || '').slice(0, 256),
+          output: String(record.output || '').slice(0, 19000),
+          status: record.status === 'sending' || record.status === 'uncertain' ? record.status : 'queued',
+          attempts: Number.isSafeInteger(record.attempts) && record.attempts >= 0 ? record.attempts : 0,
+          createdAt: typeof record.createdAt === 'string' ? record.createdAt : new Date().toISOString(),
+          lastErrorCode: typeof record.lastErrorCode === 'string' ? record.lastErrorCode.slice(0, 48) : ''
+        }
+        if (!safeRecord.chatId || !safeRecord.openId || !safeRecord.replyToMessageId) throw new Error('Feishu outbox record is missing its bound delivery target')
+        if (index >= 0) journal.feishuOutbox[index] = safeRecord
+        else {
+          if (journal.feishuOutbox.length >= FEISHU_OUTBOX_LIMIT) fail('飞书待发送回复队列已满', 429)
+          journal.feishuOutbox.push(safeRecord)
+        }
+      }
+      return { write: true, value: id }
+    })
+    return id
+  }
+
+  async writeFeishuPending(sessionId, record, { remove = false } = {}) {
+    const id = record.dshMessageId || record.id
+    if (typeof id !== 'string' || !id || id.length > 256) throw new Error('Invalid persisted Feishu message ID')
+    await this.withBridgeJournal(sessionId, (journal) => {
+      const index = journal.feishuPending.findIndex((entry) => entry.id === id)
+      if (remove) {
+        if (index >= 0) journal.feishuPending.splice(index, 1)
+      } else {
+        const safeRecord = {
+          id,
+          sessionId,
+          eventKey: String(record.eventKey || '').slice(0, 512),
+          chatId: String(record.chatId || '').slice(0, 256),
+          openId: String(record.openId || '').slice(0, 256),
+          replyToMessageId: String(record.replyToMessageId || '').slice(0, 256),
+          output: String(record.output || '').slice(0, 19000),
+          status: ['pending', 'running', 'completed', 'sent'].includes(record.status) ? record.status : 'pending',
+          ...(Number.isSafeInteger(record.turn) ? { turn: record.turn } : {}),
+          createdAt: typeof record.createdAt === 'string' ? record.createdAt : new Date().toISOString()
+        }
+        if (!safeRecord.eventKey || !safeRecord.chatId || !safeRecord.openId || !safeRecord.replyToMessageId) throw new Error('Feishu pending record is missing its bound target')
+        if (index >= 0) journal.feishuPending[index] = safeRecord
+        else {
+          if (journal.feishuPending.length >= FEISHU_PENDING_LIMIT) fail('飞书进行中回复映射队列已满', 429)
+          journal.feishuPending.push(safeRecord)
+        }
+      }
+      return { write: true, value: id }
+    })
+    return id
   }
 
   async findProjectFileCollision(workspaceRoot, filename) {
@@ -425,20 +856,32 @@ class ProjectHub extends Service {
     const entry = { ...pending, expiresAt: Date.now() + INBOUND_FILE_CONFIRM_TTL_MS, busy: false, timer: undefined }
     entry.timer = setTimeout(() => {
       if (map.get(key) === entry) map.delete(key)
-      for (const file of entry.files || []) file.bytes = undefined
-      entry.files = []
+      this.releasePendingFileBytes(entry)
     }, INBOUND_FILE_CONFIRM_TTL_MS)
     entry.timer.unref?.()
     map.set(key, entry)
     return entry
   }
 
-  clearPendingFileOverwrite(map, key) {
+  clearPendingFileOverwrite(map, key, { preserveBytes = false } = {}) {
     const entry = map.get(key)
     if (!entry) return undefined
     clearTimeout(entry.timer)
     map.delete(key)
+    if (!preserveBytes) this.releasePendingFileBytes(entry)
     return entry
+  }
+
+  releasePendingFileBytes(entry) {
+    for (const file of entry?.files || []) {
+      try { file.bytes?.fill?.(0) } catch {}
+      file.bytes = undefined
+    }
+    if (entry) entry.files = []
+  }
+
+  clearAllPendingFileOverwrites(map) {
+    for (const key of [...map.keys()]) this.clearPendingFileOverwrite(map, key)
   }
 
   async saveInboundFileBatch({ map, key, files, workspace, project, session, sessionId, reply, savedBefore = [] }) {
@@ -459,6 +902,8 @@ class ProjectHub extends Service {
         return { pending: true, saved }
       }
       saved.push(`files/${result.filename}`)
+      try { item.bytes?.fill?.(0) } catch {}
+      item.bytes = undefined
     }
     return { pending: false, saved }
   }
@@ -618,15 +1063,15 @@ class ProjectHub extends Service {
 
   async workspaceForSession(sessionId, { requireActive = true } = {}) {
     const session = this.ctx.sessions.get(sessionId)
-    if (!session && requireActive) fail('DSH 会话尚未激活，暂时不能访问项目', 403)
-    if (session && (typeof session.header?.cwd !== 'string' || !session.header.cwd)) fail('会话没有有效工作目录，拒绝访问项目', 403)
+    if (!session && requireActive) failWithCode('DSH 会话尚未激活，暂时不能访问项目', 403, 'SESSION_NOT_ACTIVE')
+    if (session && (typeof session.header?.cwd !== 'string' || !session.header.cwd)) failWithCode('会话没有有效工作目录，拒绝访问项目', 403, 'SESSION_CWD_MISSING')
     const matches = this.ctx.workspaceRegistry.list().filter((workspace) => workspace.sessionIds.includes(sessionId))
-    if (matches.length !== 1) fail(matches.length ? '会话同时属于多个 DSH 工作区，拒绝访问' : '当前 DSH 会话不属于已登记工作区', 403)
+    if (matches.length !== 1) failWithCode(matches.length ? '会话同时属于多个 DSH 工作区，拒绝访问' : '当前 DSH 会话不属于已登记工作区', 403, matches.length ? 'SESSION_WORKSPACE_AMBIGUOUS' : 'SESSION_WORKSPACE_UNREGISTERED')
     if (session) {
       let byPath
       try { byPath = await this.ctx.workspaceRegistry.resolveByPath(session.header.cwd) }
-      catch { fail('无法验证会话工作目录，拒绝访问项目', 403) }
-      if (!byPath || byPath.id !== matches[0].id || byPath.path !== matches[0].path) fail('会话工作目录与 DSH 工作区不匹配，拒绝访问', 403)
+      catch { failWithCode('无法验证会话工作目录，拒绝访问项目', 403, 'SESSION_WORKSPACE_PATH_UNVERIFIABLE') }
+      if (!byPath || byPath.id !== matches[0].id || byPath.path !== matches[0].path) failWithCode('会话工作目录与 DSH 工作区不匹配，拒绝访问项目', 403, 'SESSION_WORKSPACE_PATH_MISMATCH')
     }
     return { workspace: matches[0], session }
   }
@@ -689,7 +1134,7 @@ class ProjectHub extends Service {
   async projectForSession(sessionId, signal) {
     const { workspace, session } = await this.workspaceForSession(sessionId)
     const projects = await this.listProjects(signal, workspace.path)
-    if (!projects.length) return { workspace, session, project: await this.ensureWorkspaceProject(workspace.id, { name: workspace.title, sessionId }, signal) }
+    if (!projects.length) fail('当前 Workspace 尚未显式初始化 Project Hub 项目', 404)
     if (projects.length > 1) fail(`工作区 ${workspace.title} 中存在多个旧项目，需先迁移为一项目一工作区`, 409)
     const project = await this.readProject(projects[0].id, signal, workspace.path)
     if (project.workspaceId && project.workspaceId !== workspace.id) fail('项目与 DSH 工作区绑定不一致，拒绝访问', 403)
@@ -698,7 +1143,7 @@ class ProjectHub extends Service {
       const foreignOwner = this.ctx.workspaceRegistry.list().some((candidate) => candidate.id !== workspace.id && candidate.sessionIds.includes(project.assistantSessionId))
       if (foreignOwner) fail('项目助手会话属于其他 DSH 工作区，拒绝访问', 403)
     }
-    if (!project.workspaceId || !assistantBound || project.path !== '.') return { workspace, session, project: await this.ensureWorkspaceProject(workspace.id, { name: project.name, sessionId }, signal) }
+    if (!project.workspaceId || !assistantBound || project.path !== '.') fail('项目资料需要在当前 Workspace 的 Project Hub 面板中明确迁移或修复后才能修改', 409)
     return { workspace, session, project }
   }
 
@@ -731,7 +1176,7 @@ class ProjectHub extends Service {
   }
 
   getWeComStatus() {
-    return { ...this.wecomStatus, credentialSource: this.wecomCredentialSource }
+    return { ...this.wecomStatus, credentialSource: this.wecomCredentialSource, bridgeJournalDiagnostics: { ...this.bridgeJournalDiagnostics } }
   }
 
   createFeishuCredentialEntry() {
@@ -755,7 +1200,7 @@ class ProjectHub extends Service {
 
   getFeishuStatus() {
     const { sequence: _sequence, ...inboundDiagnostics } = this.feishuInboundDiagnostics
-    return { ...this.feishuStatus, credentialSource: this.feishuCredentialSource, inboundDiagnostics, replyDiagnostics: { ...this.feishuReplyDiagnostics } }
+    return { ...this.feishuStatus, credentialSource: this.feishuCredentialSource, inboundDiagnostics, cardActionDiagnostics: { ...this.feishuCardActionDiagnostics }, replyDiagnostics: { ...this.feishuReplyDiagnostics }, bridgeJournalDiagnostics: { ...this.bridgeJournalDiagnostics } }
   }
 
   recordFeishuReplyOutcome(outcome, error) {
@@ -763,9 +1208,10 @@ class ProjectHub extends Service {
     const code = typeof error?.code === 'string' && allowedCodes.has(error.code) ? error.code : error ? 'other' : null
     const pendingTurnReplies = [...this.feishuTurnReplies.values()].reduce((total, replies) => total + replies.length, 0)
     this.feishuReplyDiagnostics = {
-      pendingCount: this.feishuPendingMessages.size + pendingTurnReplies,
+      pendingCount: this.feishuPendingMessages.size + pendingTurnReplies + this.feishuDurableOutbox.size,
       sentCount: this.feishuReplyDiagnostics.sentCount + (outcome === 'sent' ? 1 : 0),
-      failedCount: this.feishuReplyDiagnostics.failedCount + (outcome === 'send-failed' || outcome === 'agent-followup-failed' ? 1 : 0),
+      failedCount: this.feishuReplyDiagnostics.failedCount + (outcome === 'send-failed' || outcome === 'agent-followup-failed' || outcome === 'outbox-persist-failed' ? 1 : 0),
+      uncertainCount: this.feishuReplyDiagnostics.uncertainCount,
       lastAt: new Date().toISOString(),
       lastOutcome: outcome,
       lastErrorCode: code
@@ -864,7 +1310,10 @@ class ProjectHub extends Service {
         if (this.feishuClient === client) this.feishuStatus = { state: 'reconnecting', label: '飞书长连接重连中' }
       })
       client.on('reconnected', () => {
-        if (this.feishuClient === client) this.feishuStatus = { state: 'connected', label: '飞书长连接已连接' }
+        if (this.feishuClient === client) {
+          this.feishuStatus = { state: 'connected', label: '飞书长连接已连接' }
+          void this.recoverFeishuOutbox()
+        }
       })
       client.on('reject', (event) => {
         if (this.feishuClient === client) this.recordFeishuReject(event)
@@ -877,7 +1326,7 @@ class ProjectHub extends Service {
       Promise.resolve(client.connect()).then(() => {
         if (this.feishuClient === client) {
           this.feishuStatus = { state: 'connected', label: '飞书长连接已连接' }
-          void this.sendFeishuProjectPickersOnStartup()
+          void this.restoreFeishuStateOnStartup()
         }
       }).catch(() => {
         if (this.feishuClient === client) this.feishuStatus = { state: 'error', label: '飞书长连接失败（检查 App 凭证、机器人权限和网络）' }
@@ -894,6 +1343,7 @@ class ProjectHub extends Service {
     this.feishuClient = null
     try { void client?.disconnect()?.catch?.(() => {}) } catch {}
     this.feishuPendingMessages.clear()
+    this.clearAllPendingFileOverwrites(this.feishuPendingFileOverwrites)
     this.feishuOpenTurns.clear()
     this.feishuTurnReplies.clear()
     this.feishuMirrorTurnReplies.clear()
@@ -1130,7 +1580,11 @@ class ProjectHub extends Service {
       this.wecomClient = client
       this.wecomStatus = { state: 'connecting', label: '长连接连接中' }
       client.on('connected', () => { if (this.wecomClient === client) this.wecomStatus = { state: 'connecting', label: '已连接，正在认证' } })
-      client.on('authenticated', () => { if (this.wecomClient === client) this.wecomStatus = { state: 'connected', label: '长连接已认证' } })
+      client.on('authenticated', () => {
+        if (this.wecomClient !== client) return
+        this.wecomStatus = { state: 'connected', label: '长连接已认证' }
+        void this.restoreBoundBridgeSessions()
+      })
       client.on('reconnecting', () => { if (this.wecomClient === client) this.wecomStatus = { state: 'reconnecting', label: '长连接重连中' } })
       client.on('disconnected', () => { if (this.wecomClient === client) this.wecomStatus = { state: 'disconnected', label: '长连接已断开' } })
       client.on('error', () => { if (this.wecomClient === client) this.wecomStatus = { state: 'error', label: '长连接出错（检查 Bot 凭证和网络）' } })
@@ -1149,6 +1603,7 @@ class ProjectHub extends Service {
     this.wecomClient = null
     try { client?.disconnect() } catch {}
     this.wecomPendingMessages.clear()
+    this.clearAllPendingFileOverwrites(this.wecomPendingFileOverwrites)
     this.wecomOpenTurns.clear()
     this.wecomTurnReplies.clear()
     this.wecomMirrorTurnReplies.clear()
@@ -1193,13 +1648,17 @@ class ProjectHub extends Service {
     return { userId: binding.userId.trim(), sessionId: binding.sessionId.trim(), syncMessages }
   }
 
-  saveWeComBinding(userIdValue, sessionIdValue, syncMessages = false) {
+  saveWeComBinding(userIdValue, sessionIdValue, syncMessagesValue) {
     const userId = safeText(userIdValue, '企业微信 UserID', 128)
     const sessionId = safeText(sessionIdValue, 'DSH Session ID', 100)
     if (/[\u0000-\u001f\u007f]/.test(userId)) fail('企业微信 UserID 格式无效')
-    try { this.createWeComBindingEntry().setPassword(JSON.stringify({ userId, sessionId, syncMessages: Boolean(syncMessages) })) }
+    let previous
+    try { previous = this.readStoredWeComBinding() } catch { fail('无法读取系统凭证库中的企业微信绑定', 503) }
+    const sameBinding = previous?.sessionId === sessionId && previous?.userId === userId
+    const syncMessages = typeof syncMessagesValue === 'boolean' ? syncMessagesValue : sameBinding && previous.syncMessages
+    try { this.createWeComBindingEntry().setPassword(JSON.stringify({ userId, sessionId, syncMessages })) }
     catch { fail('无法将企业微信绑定写入系统凭证库', 503) }
-    return { state: 'bound', userId, syncMessages: Boolean(syncMessages) }
+    return { state: 'bound', userId, syncMessages }
   }
 
   getWeComPairingStatus(sessionId, workspaceSessionIds = []) {
@@ -1364,9 +1823,13 @@ class ProjectHub extends Service {
       const key = `${sessionId}:${turn}`
       if (record?.sessionId === sessionId) {
         this.feishuPendingMessages.delete(userMessage.id)
+        record.dshMessageId = userMessage.id
+        record.turn = turn
+        record.status = 'running'
         const replies = this.feishuTurnReplies.get(key) || []
-        replies.push(record)
+        if (!replies.some((reply) => reply.dshMessageId === userMessage.id)) replies.push(record)
         this.feishuTurnReplies.set(key, replies)
+        void this.writeFeishuPending(sessionId, record).catch(() => this.ctx.logger.warn('project-hub: failed to persist Feishu turn mapping'))
         this.recordFeishuReplyOutcome('user-event-matched')
       } else if (userMessage.source?.kind === 'user') {
         const origin = this.externalMessageOrigins.get(userMessage.id)
@@ -1393,7 +1856,11 @@ class ProjectHub extends Service {
       this.appendMirrorAnswer(this.feishuMirrorTurnReplies, key, answer)
       const replies = this.feishuTurnReplies.get(key)
       if (replies?.length && answer) {
-        for (const record of replies) record.output = `${record.output ? `${record.output}\n\n` : ''}${answer}`
+        for (const record of replies) {
+          record.output = `${record.output ? `${record.output}\n\n` : ''}${answer}`
+          record.status = 'running'
+          void this.writeFeishuPending(sessionId, record).catch(() => this.ctx.logger.warn('project-hub: failed to persist Feishu assistant output'))
+        }
         this.recordFeishuReplyOutcome('assistant-text-captured')
       }
       return
@@ -1410,34 +1877,85 @@ class ProjectHub extends Service {
         if (event.data?.reason?.kind === 'completed') {
           this.recordFeishuReplyOutcome('turn-completed')
           for (const record of replies) void this.finishFeishuReply(record)
-        } else this.recordFeishuReplyOutcome('turn-not-completed')
+        } else {
+          for (const record of replies) void this.writeFeishuPending(record.sessionId, record, { remove: true }).catch(() => {})
+          this.recordFeishuReplyOutcome('turn-not-completed')
+        }
       } else if ([...this.feishuPendingMessages.values()].some((record) => record.sessionId === sessionId)) this.recordFeishuReplyOutcome('no-mapped-user-event')
     }
   }
 
-  async finishFeishuReply(record) {
-    if (!this.feishuClient || this.feishuStatus.state !== 'connected') {
-      this.recordFeishuReplyOutcome('skipped-not-connected')
+  async finishFeishuReply(record, { existing = false } = {}) {
+    const outboxId = record.outboxId || `${record.sessionId}:${record.replyToMessageId}`
+    if (!existing && record.dshMessageId) {
+      record.status = 'completed'
+      await this.writeFeishuPending(record.sessionId, record).catch(() => this.ctx.logger.warn('project-hub: failed to persist completed Feishu turn state'))
+    }
+    const outboxRecord = { ...record, outboxId, output: String(record.output || '项目助手本轮未返回可展示的文本内容。').trim(), status: 'queued' }
+    try {
+      if (!existing) await this.writeFeishuOutbox(record.sessionId, outboxRecord)
+      this.feishuDurableOutbox.set(outboxId, outboxRecord)
+    } catch (error) {
+      this.recordFeishuReplyOutcome('outbox-persist-failed', error)
+      this.ctx.logger.warn('project-hub: failed to persist completed Feishu reply')
       return
     }
+    let pendingRemoved = true
+    if (record.dshMessageId) {
+      try { await this.writeFeishuPending(record.sessionId, record, { remove: true }) }
+      catch { pendingRemoved = false }
+    }
+    if (!this.feishuClient || this.feishuStatus.state !== 'connected') return
     let binding
     try { binding = this.readStoredFeishuBinding({ sessionId: record.sessionId, chatId: record.chatId, openId: record.openId }) } catch {
       this.recordFeishuReplyOutcome('binding-read-failed')
       return
     }
     if (!binding) {
+      await this.writeFeishuOutbox(record.sessionId, outboxRecord, { remove: true }).catch(() => {})
+      this.feishuDurableOutbox.delete(outboxId)
       this.recordFeishuReplyOutcome('binding-mismatch')
       return
     }
-    const answer = String(record.output || '项目助手本轮未返回可展示的文本内容。').trim()
+    outboxRecord.status = 'sending'
+    try { await this.writeFeishuOutbox(record.sessionId, outboxRecord) }
+    catch (error) {
+      this.recordFeishuReplyOutcome('outbox-persist-failed', error)
+      return
+    }
+    const answer = outboxRecord.output
     const capped = answer.length > 19000 ? `${answer.slice(0, 18980)}\n\n（内容过长，已截断）` : answer
     try {
       await this.feishuClient.sendText({ chatId: record.chatId, content: capped, replyToMessageId: record.replyToMessageId })
-      this.recordFeishuReplyOutcome('sent')
     } catch (error) {
+      outboxRecord.status = 'queued'
+      outboxRecord.attempts += 1
+      outboxRecord.lastErrorCode = typeof error?.code === 'string' ? error.code.slice(0, 48) : 'other'
+      await this.writeFeishuOutbox(record.sessionId, outboxRecord).catch(() => {})
+      this.feishuDurableOutbox.set(outboxId, outboxRecord)
       this.recordFeishuReplyOutcome('send-failed', error)
       this.ctx.logger.warn('project-hub: failed to send Feishu assistant reply; the DSH turn will not be rerun')
+      return
     }
+    if (!pendingRemoved && record.dshMessageId) {
+      try { await this.writeFeishuPending(record.sessionId, { ...record, status: 'sent' }) }
+      catch {
+        outboxRecord.status = 'uncertain'
+        this.feishuDurableOutbox.set(outboxId, outboxRecord)
+        this.feishuReplyDiagnostics.uncertainCount += 1
+        this.recordFeishuReplyOutcome('sent-with-pending-journal-error')
+        return
+      }
+    }
+    try {
+      await this.writeFeishuOutbox(record.sessionId, outboxRecord, { remove: true })
+      this.feishuDurableOutbox.delete(outboxId)
+    } catch {
+      outboxRecord.status = 'uncertain'
+      this.feishuDurableOutbox.set(outboxId, outboxRecord)
+      this.feishuReplyDiagnostics.uncertainCount += 1
+    }
+    this.recordFeishuReplyOutcome('sent')
   }
 
   async finishWeComReply(record) {
@@ -1521,8 +2039,11 @@ class ProjectHub extends Service {
       const result = await this.writeInboundProjectFile({ workspace, session, filename: first.filename, bytes: first.bytes, overwrite: true })
       const savedBefore = [...(pending.savedBefore || []), `files/${result.filename}`]
       const remaining = pending.files.slice(1)
-      this.clearPendingFileOverwrite(map, key)
+      this.clearPendingFileOverwrite(map, key, { preserveBytes: true })
+      try { first.bytes?.fill?.(0) } catch {}
+      first.bytes = undefined
       const continued = remaining.length ? await this.saveInboundFileBatch({ map, key, files: remaining, workspace, project, session, sessionId, reply, savedBefore }) : { pending: false, saved: savedBefore }
+      if (!remaining.length) pending.files = []
       if (continued.pending) return true
       await reply(`已保存文件：${continued.saved.join('、')}。文件仅保存在项目目录中，未送入助手读取。`)
     } catch {
@@ -1547,8 +2068,6 @@ class ProjectHub extends Service {
       try { await this.wecomClient?.replyText(frame, text) } catch {}
     }
     if (!msgid || this.wecomSeenMessages.has(msgid)) return
-    this.wecomSeenMessages.set(msgid, Date.now())
-    while (this.wecomSeenMessages.size > 5000) this.wecomSeenMessages.delete(this.wecomSeenMessages.keys().next().value)
 
     if (body.chattype !== 'single') {
       await reply('Project Hub 目前仅启用单聊；群聊需显式绑定项目与会话后再接入。')
@@ -1596,6 +2115,29 @@ class ProjectHub extends Service {
       await reply('目前仅支持非空文本消息。')
       return
     }
+    const fileDescriptor = isFile ? body.file : null
+    if (isFile && (typeof fileDescriptor?.url !== 'string' || !fileDescriptor.url || typeof fileDescriptor.aeskey !== 'string' || !fileDescriptor.aeskey)) {
+      await reply('企业微信文件消息缺少有效的下载地址或解密密钥，附件未保存。')
+      return
+    }
+    if (!isFile && this.wecomPendingMessages.size >= 100) {
+      await reply('当前企业微信消息队列繁忙，请稍后重试。')
+      return
+    }
+    if (!this.wecomClient || this.wecomStatus.state !== 'connected') {
+      await reply('企业微信长连接当前不可用，消息未送入 DSH。')
+      return
+    }
+    let duplicateEvent = false
+    try { duplicateEvent = await this.claimBridgeEvent(bindingSessionId, 'wecom', msgid) }
+    catch (error) {
+      this.recordBridgeJournalFailure('wecom', error)
+      await reply(bridgeJournalClaimFailureNotice(error))
+      return
+    }
+    if (duplicateEvent) return
+    this.wecomSeenMessages.set(msgid, Date.now())
+    while (this.wecomSeenMessages.size > 5000) this.wecomSeenMessages.delete(this.wecomSeenMessages.keys().next().value)
     const overwriteKey = `wecom:${bindingSessionId}:${userId}`
     if (isText) {
       const handled = await this.handlePendingFileOverwriteReply({
@@ -1616,19 +2158,6 @@ class ProjectHub extends Service {
       }
     }
 
-    const fileDescriptor = isFile ? body.file : null
-    if (isFile && (typeof fileDescriptor?.url !== 'string' || !fileDescriptor.url || typeof fileDescriptor.aeskey !== 'string' || !fileDescriptor.aeskey)) {
-      await reply('企业微信文件消息缺少有效的下载地址或解密密钥，附件未保存。')
-      return
-    }
-    if (!isFile && this.wecomPendingMessages.size >= 100) {
-      await reply('当前企业微信消息队列繁忙，请稍后重试。')
-      return
-    }
-    if (!this.wecomClient || this.wecomStatus.state !== 'connected') {
-      await reply('企业微信长连接当前不可用，消息未送入 DSH。')
-      return
-    }
     const streamId = this.wecomClient.createStreamId()
     try { await this.wecomClient.replyStream(frame, streamId, isFile ? '收到文件，正在保存到项目 files/ 目录；不会读取内容…' : '收到，正在调用 DSH 项目助手…', false) } catch {}
     let failureStage = 'project-binding'
@@ -1678,6 +2207,8 @@ class ProjectHub extends Service {
             if (this.wecomPendingMessages.get(messageId) !== record) return
             this.wecomPendingMessages.delete(messageId)
             this.externalMessageOrigins.delete(messageId)
+            this.wecomSeenMessages.delete(msgid)
+            void this.releaseBridgeEvent(bindingSessionId, 'wecom', msgid).catch(() => {})
             const code = typeof error?.code === 'string' ? error.code.replace(/[^A-Za-z0-9_-]/g, '_').replace(/_+/g, '_').slice(0, 48) || 'ERROR' : error?.name === 'Error' ? 'ERROR' : 'UNKNOWN'
             this.ctx.logger.warn(`project-hub: WeCom inbound ${eventType} failed at agent-followup (${code})`)
             try { void this.wecomClient?.replyStream(frame, streamId, '消息未能送入 DSH 项目助手。请检查项目绑定和助手 Agent 状态。', true)?.catch?.(() => {}) } catch {}
@@ -1686,6 +2217,8 @@ class ProjectHub extends Service {
       } catch (error) {
         this.wecomPendingMessages.delete(messageId)
         this.externalMessageOrigins.delete(messageId)
+        this.wecomSeenMessages.delete(msgid)
+        await this.releaseBridgeEvent(bindingSessionId, 'wecom', msgid).catch(() => {})
         throw error
       }
     } catch (error) {
@@ -1736,15 +2269,57 @@ class ProjectHub extends Service {
     }
   }
 
-  async sendFeishuProjectPickersOnStartup() {
-    let conversations
-    try { conversations = this.readStoredFeishuConversations() } catch { return }
-    for (const conversation of conversations) {
-      await this.refreshFeishuProjectPicker({ ...conversation, forceNew: true })
-    }
+  async restoreFeishuStateOnStartup() {
+    await this.restoreBoundBridgeSessions()
+    await this.recoverFeishuOutbox()
   }
 
-  async refreshFeishuProjectPicker({ tenantKey, chatId, openId, replyToMessageId, forceNew = false } = {}) {
+  async recoverFeishuOutbox(conversations) {
+    if (this.feishuOutboxRecoveryRunning || !this.feishuClient || this.feishuStatus.state !== 'connected') return
+    this.feishuOutboxRecoveryRunning = true
+    try {
+      const stored = conversations || this.readStoredFeishuConversations()
+      const sessionIds = [...new Set(stored.flatMap((conversation) => conversation.bindings.map((binding) => binding.sessionId)))]
+      for (const sessionId of sessionIds) {
+        let journal
+        try { journal = await this.readBridgeJournal(sessionId) } catch { continue }
+        for (const entry of journal.feishuOutbox) {
+          const record = { ...entry, outboxId: entry.id }
+          this.feishuDurableOutbox.set(entry.id, record)
+          if (entry.status === 'sending') {
+            record.status = 'uncertain'
+            await this.writeFeishuOutbox(sessionId, record)
+            this.feishuReplyDiagnostics.uncertainCount += 1
+            this.recordFeishuReplyOutcome('delivery-uncertain-after-restart')
+          } else if (entry.status === 'queued') {
+            await this.finishFeishuReply(record, { existing: true })
+          }
+        }
+        const outboxMessageIds = new Set(journal.feishuOutbox.map((entry) => entry.dshMessageId).filter(Boolean))
+        for (const entry of journal.feishuPending) {
+          if (entry.status === 'sent' || outboxMessageIds.has(entry.id)) continue
+          const record = { ...entry, dshMessageId: entry.id }
+          if (entry.status === 'completed') {
+            await this.finishFeishuReply(record)
+            continue
+          }
+          if (!Number.isSafeInteger(entry.turn)) this.feishuPendingMessages.set(entry.id, record)
+          this.externalMessageOrigins.set(entry.id, { platform: 'feishu', sessionId })
+          if (Number.isSafeInteger(entry.turn)) {
+            const turnKey = `${sessionId}:${entry.turn}`
+            const replies = this.feishuTurnReplies.get(turnKey) || []
+            if (!replies.some((reply) => reply.dshMessageId === entry.id)) replies.push(record)
+            this.feishuTurnReplies.set(turnKey, replies)
+            this.feishuOpenTurns.set(sessionId, entry.turn)
+          }
+        }
+      }
+    } catch {
+      this.ctx.logger.warn('project-hub: failed to recover persisted Feishu replies')
+    } finally { this.feishuOutboxRecoveryRunning = false }
+  }
+
+  async refreshFeishuProjectPicker({ tenantKey, chatId, openId, replyToMessageId, createIfMissing = true, forceNew = false } = {}) {
     if (!this.feishuClient || this.feishuStatus.state !== 'connected') return false
     let conversation
     try { conversation = this.readStoredFeishuConversation({ tenantKey, chatId, openId }) } catch { return false }
@@ -1755,9 +2330,10 @@ class ProjectHub extends Service {
         await this.feishuClient.updateCard({ messageId: conversation.pickerMessageId, card })
         return true
       } catch {
-        this.ctx.logger.warn('project-hub: failed to update Feishu project picker; sending a replacement card')
+        this.ctx.logger.warn('project-hub: failed to update Feishu project picker')
       }
     }
+    if (!createIfMissing) return false
     try {
       const result = await this.feishuClient.sendCard({ chatId, card, replyToMessageId })
       if (!result?.messageId) return false
@@ -1779,23 +2355,59 @@ class ProjectHub extends Service {
     const openId = typeof event?.operator?.openId === 'string' ? event.operator.openId.trim() : ''
     const action = event?.action
     const value = action?.value
-    if (!chatId || !messageId || !openId || action?.tag !== 'button' || !value || typeof value !== 'object' || Array.isArray(value) || value.kind !== 'project.select') return false
-    let conversation
-    try { conversation = this.readStoredFeishuConversation({ chatId, openId }) } catch { return false }
-    if (!conversation) return false
-    const binding = conversation.bindings.find((candidate) => candidate.sessionId === value.sessionId && candidate.projectId === value.projectId)
-    if (!binding) {
-      await this.refreshFeishuProjectPicker({ ...conversation, forceNew: true })
+    const previousCount = this.feishuCardActionDiagnostics.count
+    const recordCardAction = (patch) => {
+      this.feishuCardActionDiagnostics = { ...this.feishuCardActionDiagnostics, count: previousCount + 1, lastAt: new Date().toISOString(), ...patch }
+    }
+    if (!chatId || !messageId || !openId || action?.tag !== 'button' || !value || typeof value !== 'object' || Array.isArray(value) || value.kind !== 'project.select') {
+      recordCardAction({ lastOutcome: 'invalid-card-action' })
       return false
     }
-    if (!this.setFeishuActiveProject({ tenantKey: conversation.tenantKey, chatId, openId, sessionId: binding.sessionId })) return false
-    await this.refreshFeishuProjectPicker({ tenantKey: conversation.tenantKey, chatId, openId })
-    try {
-      const updatedConversation = this.readStoredFeishuConversation({ tenantKey: conversation.tenantKey, chatId, openId })
-      if (updatedConversation?.pickerMessageId && updatedConversation.pickerMessageId !== messageId) {
-        await this.feishuClient.updateCard({ messageId, card: this.buildFeishuProjectPickerCard(updatedConversation) })
+    let conversation
+    try { conversation = this.readStoredFeishuConversation({ chatId, openId }) } catch {
+      recordCardAction({ lastOutcome: 'binding-read-failed' })
+      return false
+    }
+    if (!conversation) {
+      recordCardAction({ lastOutcome: 'unauthorized-or-unbound' })
+      return false
+    }
+    const binding = conversation.bindings.find((candidate) => candidate.sessionId === value.sessionId && candidate.projectId === value.projectId)
+    if (!binding) {
+      await this.refreshFeishuProjectPicker({ ...conversation })
+      recordCardAction({ lastOutcome: 'stale-project-button', activeProject: conversation.bindings.find((candidate) => candidate.sessionId === conversation.activeSessionId)?.projectName || null })
+      return false
+    }
+    if (!this.setFeishuActiveProject({ tenantKey: conversation.tenantKey, chatId, openId, sessionId: binding.sessionId })) {
+      recordCardAction({ lastOutcome: 'active-selection-failed', selectedProject: binding.projectName })
+      return false
+    }
+
+    const oldPickerMessageId = conversation.pickerMessageId || ''
+    let pickerRefreshed = await this.refreshFeishuProjectPicker({ tenantKey: conversation.tenantKey, chatId, openId, replyToMessageId: messageId, forceNew: true })
+    if (!pickerRefreshed) pickerRefreshed = await this.refreshFeishuProjectPicker({ tenantKey: conversation.tenantKey, chatId, openId, replyToMessageId: messageId })
+
+    let currentConversation = null
+    try { currentConversation = this.readStoredFeishuConversation({ tenantKey: conversation.tenantKey, chatId, openId }) } catch {}
+    const replacementMessageId = currentConversation?.pickerMessageId || ''
+    let recalledCount = 0
+    let recallFailedCount = 0
+    if (pickerRefreshed && replacementMessageId && typeof this.feishuClient?.recallMessage === 'function') {
+      for (const oldMessageId of new Set([messageId, oldPickerMessageId])) {
+        if (!oldMessageId || oldMessageId === replacementMessageId) continue
+        try {
+          await this.feishuClient.recallMessage({ messageId: oldMessageId })
+          recalledCount++
+        } catch { recallFailedCount++ }
       }
-    } catch {}
+    }
+    recordCardAction({
+      lastOutcome: pickerRefreshed ? 'switched-card-replaced' : 'switched-card-refresh-failed',
+      selectedProject: binding.projectName,
+      activeProject: currentConversation?.bindings.find((candidate) => candidate.sessionId === currentConversation.activeSessionId)?.projectName || null,
+      clickedCanonicalCard: oldPickerMessageId === messageId,
+      oldCardRecall: `${recalledCount}/${recallFailedCount}`
+    })
     return true
   }
 
@@ -1837,12 +2449,6 @@ class ProjectHub extends Service {
       this.setFeishuInboundOutcome(diagnosticSequence, 'duplicate-event')
       return
     }
-    this.feishuSeenMessages.set(eventKey, now)
-    const cutoff = now - 24 * 60 * 60 * 1000
-    for (const [key, timestamp] of this.feishuSeenMessages) {
-      if (timestamp >= cutoff && this.feishuSeenMessages.size <= FEISHU_SEEN_LIMIT) break
-      this.feishuSeenMessages.delete(key)
-    }
 
     const text = typeof message.content === 'string' ? message.content.trim() : ''
     const isText = message.rawContentType === 'text' && (!rawMessage.message_type || rawMessage.message_type === 'text')
@@ -1864,9 +2470,7 @@ class ProjectHub extends Service {
           projectName: workspace.title || project.name,
           workspaceId: activeChallenge.workspaceId
         })
-        const replied = await this.sendFeishuNotice(chatId, `已将「${workspace.title || project.name}」绑定到此飞书私聊。请直接点击“选择项目助手”卡片中的项目按钮切换。`, messageId)
-        const pickerUpdated = await this.refreshFeishuProjectPicker({ tenantKey, chatId, openId: senderOpenId, replyToMessageId: messageId, forceNew: true })
-        if (!pickerUpdated) await this.sendFeishuNotice(chatId, '项目绑定已完成，但选择卡片未能显示；请检查飞书卡片按钮回调设置，并在 Project Hub 点击“在飞书显示项目选择卡片”重试。', messageId)
+        const replied = await this.sendFeishuNotice(chatId, `已将「${workspace.title || project.name}」绑定到此飞书私聊。需要切换助手时，请发送 /切换会话 或 /项目列表 主动显示选择卡片。`, messageId)
         this.setFeishuInboundOutcome(diagnosticSequence, replied ? 'paired-replied' : 'pair-reply-failed')
       } catch {
         const replied = await this.sendFeishuNotice(chatId, '飞书配对未能完成；请确认 DSH 项目和助手会话仍有效，然后重新生成配对码。', messageId)
@@ -1894,14 +2498,28 @@ class ProjectHub extends Service {
       this.setFeishuInboundOutcome(diagnosticSequence, replied ? 'unpaired-notice-sent' : 'unpaired-notice-failed')
       return
     }
-    if (!conversation.pickerMessageId) {
-      await this.refreshFeishuProjectPicker({ tenantKey, chatId, openId: senderOpenId, replyToMessageId: messageId })
-      try { conversation = this.readStoredFeishuConversation({ tenantKey, chatId, openId: senderOpenId }) || conversation } catch {}
-    }
     let binding = conversation.bindings.find((candidate) => candidate.sessionId === conversation.activeSessionId) || conversation.bindings[0]
     if (!binding) {
       this.setFeishuInboundOutcome(diagnosticSequence, 'no-active-project')
       return
+    }
+    let duplicateEvent = false
+    try { duplicateEvent = await this.claimBridgeEvent(binding.sessionId, 'feishu', eventKey) }
+    catch (error) {
+      this.recordBridgeJournalFailure('feishu', error)
+      await this.sendFeishuNotice(chatId, bridgeJournalClaimFailureNotice(error), messageId)
+      this.setFeishuInboundOutcome(diagnosticSequence, error?.code === 'SESSION_NOT_ACTIVE' ? 'bound-session-inactive' : error?.code === 'SESSION_AUTO_RESUME_FAILED' ? 'bound-session-auto-resume-failed' : typeof error?.code === 'string' && error.code.startsWith('SESSION_') ? 'bound-session-validation-failed' : 'journal-write-failed')
+      return
+    }
+    if (duplicateEvent) {
+      this.setFeishuInboundOutcome(diagnosticSequence, 'duplicate-event')
+      return
+    }
+    this.feishuSeenMessages.set(eventKey, now)
+    const cutoff = now - BRIDGE_EVENT_TTL_MS
+    for (const [key, timestamp] of this.feishuSeenMessages) {
+      if (timestamp >= cutoff && this.feishuSeenMessages.size <= FEISHU_SEEN_LIMIT) break
+      this.feishuSeenMessages.delete(key)
     }
     const overwriteKey = `feishu:${tenantKey}:${senderOpenId}:${chatId}:${binding.sessionId}`
     if (isText && text) {
@@ -1917,18 +2535,23 @@ class ProjectHub extends Service {
     if (isText && text) {
       const normalizedCommand = text.trim()
       if (/^\/?(?:帮助|help)$/i.test(normalizedCommand)) {
-        const replied = await this.sendFeishuNotice(chatId, '请直接点击“选择项目助手”卡片中的项目按钮切换；发送 /项目列表 可重新显示选择卡片。普通文本和文件会送入当前项目助手。', messageId)
+        const replied = await this.sendFeishuNotice(chatId, '需要切换助手时，发送 /切换会话 或 /项目列表 主动显示项目选择卡片；也可发送 /切换 <序号> 直接切换。普通文本和文件会送入当前项目助手。', messageId)
         this.setFeishuInboundOutcome(diagnosticSequence, replied ? 'project-help-sent' : 'project-help-failed')
         return
       }
-      if (/^\/?(?:项目列表|projects)$/i.test(normalizedCommand)) {
+      if (/^\/?(?:项目列表|projects|切换会话|switch(?:\s+sessions?)?)$/i.test(normalizedCommand)) {
         const refreshed = await this.refreshFeishuProjectPicker({ tenantKey, chatId, openId: senderOpenId, replyToMessageId: messageId, forceNew: true })
-        if (!refreshed) await this.sendFeishuNotice(chatId, '项目选择卡片暂时无法显示，请稍后重试或检查飞书卡片按钮回调设置。', messageId)
-        this.setFeishuInboundOutcome(diagnosticSequence, refreshed ? 'project-picker-refreshed' : 'project-picker-failed')
+        if (!refreshed) {
+          const projectChoices = conversation.bindings.map((candidate, index) => `${index + 1}. ${candidate.projectName}`).join('\n')
+          const noticeSent = await this.sendFeishuNotice(chatId, `项目选择卡片暂时无法显示。你仍可发送「切换 <序号>」直接切换已绑定项目：\n${projectChoices}`, messageId)
+          this.setFeishuInboundOutcome(diagnosticSequence, noticeSent ? 'project-picker-failed-with-help' : 'project-picker-send-failed')
+        } else {
+          this.setFeishuInboundOutcome(diagnosticSequence, 'project-picker-refreshed')
+        }
         return
       }
       if (/^\/?(?:当前项目|current)$/i.test(normalizedCommand)) {
-        const replied = await this.sendFeishuNotice(chatId, `当前项目：${binding.projectName}\n使用 /项目列表 查看其他已授权项目。`, messageId)
+        const replied = await this.sendFeishuNotice(chatId, `当前项目：${binding.projectName}\n需要切换时，发送 /切换会话 或 /项目列表。`, messageId)
         this.setFeishuInboundOutcome(diagnosticSequence, replied ? 'current-project-sent' : 'current-project-failed')
         return
       }
@@ -1937,7 +2560,7 @@ class ProjectHub extends Service {
         const requested = Number(switchMatch[1])
         const selected = conversation.bindings[requested - 1]
         if (!selected) {
-          const replied = await this.sendFeishuNotice(chatId, '项目序号无效。请先发送 /项目列表 查看可选项目。', messageId)
+          const replied = await this.sendFeishuNotice(chatId, '项目序号无效。发送 /切换会话 查看可选项目，或使用 /项目列表。', messageId)
           this.setFeishuInboundOutcome(diagnosticSequence, replied ? 'project-switch-invalid' : 'project-switch-failed')
           return
         }
@@ -1947,9 +2570,12 @@ class ProjectHub extends Service {
           return
         }
         binding = selected
-        await this.refreshFeishuProjectPicker({ tenantKey, chatId, openId: senderOpenId })
-        const replied = await this.sendFeishuNotice(chatId, `当前项目已切换为「${selected.projectName}」。`, messageId)
-        this.setFeishuInboundOutcome(diagnosticSequence, replied ? 'project-switched' : 'project-switch-reply-failed')
+        const pickerUpdated = await this.refreshFeishuProjectPicker({ tenantKey, chatId, openId: senderOpenId, replyToMessageId: messageId })
+        const notice = pickerUpdated
+          ? `当前项目已切换为「${selected.projectName}」，项目选择卡片已刷新。`
+          : `当前项目已切换为「${selected.projectName}」，但项目卡片未能更新；请稍后发送「切换会话」重新打开选择卡片。`
+        const replied = await this.sendFeishuNotice(chatId, notice, messageId)
+        this.setFeishuInboundOutcome(diagnosticSequence, replied ? pickerUpdated ? 'project-switched' : 'project-switched-picker-refresh-failed' : 'project-switch-reply-failed')
         return
       }
     }
@@ -1995,7 +2621,7 @@ class ProjectHub extends Service {
         const filesToSave = []
         for (const resource of fileResources) {
           failureStage = 'file-download'
-          const downloaded = await this.feishuClient.downloadFile(resource.fileKey)
+          const downloaded = await this.feishuClient.downloadFile(resource.fileKey, messageId)
           const bytes = downloaded?.buffer
           failureStage = 'file-validation'
           if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) throw new Error('Empty or invalid Feishu attachment')
@@ -2025,20 +2651,43 @@ class ProjectHub extends Service {
         return
       }
       const dshMessageId = makeId('feishu')
-      const record = { sessionId: binding.sessionId, chatId, openId: senderOpenId, replyToMessageId: messageId, output: '' }
+      const record = { dshMessageId, eventKey, sessionId: binding.sessionId, chatId, openId: senderOpenId, replyToMessageId: messageId, output: '', status: 'pending', createdAt: new Date().toISOString() }
       this.feishuPendingMessages.set(dshMessageId, record)
       this.trackExternalMessageOrigin(dshMessageId, { platform: 'feishu', sessionId: binding.sessionId, prompt: text })
+      try { await this.writeFeishuPending(binding.sessionId, record) }
+      catch (error) {
+        this.feishuPendingMessages.delete(dshMessageId)
+        this.externalMessageOrigins.delete(dshMessageId)
+        this.feishuSeenMessages.delete(eventKey)
+        await this.releaseBridgeEvent(binding.sessionId, 'feishu', eventKey).catch(() => {})
+        await this.sendFeishuNotice(chatId, '无法安全持久化本轮回复关联，消息未送入 DSH；请稍后重发。', messageId)
+        this.recordFeishuReplyOutcome('pending-persist-failed', error)
+        return
+      }
       this.recordFeishuReplyOutcome('awaiting-session-events')
       failureStage = 'agent-followup'
-      const accepted = agent.followup({
-        id: dshMessageId,
-        role: 'user',
-        content: [{ type: 'text', text }],
-        source: { kind: 'user' }
-      })
+      let accepted
+      try {
+        accepted = agent.followup({
+          id: dshMessageId,
+          role: 'user',
+          content: [{ type: 'text', text }],
+          source: { kind: 'user' }
+        })
+      } catch (error) {
+        this.feishuPendingMessages.delete(dshMessageId)
+        this.externalMessageOrigins.delete(dshMessageId)
+        await this.writeFeishuPending(binding.sessionId, record, { remove: true }).catch(() => {})
+        this.feishuSeenMessages.delete(eventKey)
+        await this.releaseBridgeEvent(binding.sessionId, 'feishu', eventKey).catch(() => {})
+        throw error
+      }
       if (accepted && typeof accepted.then === 'function') accepted.catch(() => {
         this.feishuPendingMessages.delete(dshMessageId)
         this.externalMessageOrigins.delete(dshMessageId)
+        void this.writeFeishuPending(binding.sessionId, record, { remove: true }).catch(() => {})
+        this.feishuSeenMessages.delete(eventKey)
+        void this.releaseBridgeEvent(binding.sessionId, 'feishu', eventKey).catch(() => {})
         this.recordFeishuReplyOutcome('agent-followup-failed')
         void this.sendFeishuNotice(chatId, '消息未能送入 DSH 项目助手；请检查项目绑定和 Agent 状态。', messageId)
       })
@@ -2098,8 +2747,15 @@ class ProjectHub extends Service {
 
   async executeAgentTool(args, signal, agent) {
     signal?.throwIfAborted()
+    if (!INTEGRATION_AGENT_ACTIONS.has(args?.action)) fail('该 Agent 工具仅支持飞书/企微集成操作；项目和任务请在 Project Hub 面板管理', 403)
     const sessionId = agent?.session?.id
     if (typeof sessionId !== 'string' || !sessionId) fail('Project Hub 工具必须由 DSH 会话调用', 403)
+    if (args.action === 'list_project_files') {
+      const path = args.path === undefined ? '' : safeText(args.path, '项目 files 子目录', 512)
+      const result = await this.agentApi('POST', sessionId, { signal, body: { action: 'project.files.list', path } })
+      const entries = Array.isArray(result.entries) ? result.entries : []
+      return JSON.stringify({ path, entries: entries.slice(0, 200), truncated: entries.length > 200 })
+    }
     if (args.action === 'send_file') {
       const path = safeText(args.path, '项目文件相对路径', 512)
       const platform = args.platform === undefined ? this.currentExternalMessagePlatform(sessionId) : safeText(args.platform, '文件发送平台', 16)
@@ -2132,44 +2788,24 @@ class ProjectHub extends Service {
       await this.wecomClient.sendText({ recipient, content: text })
       return JSON.stringify({ sent: true, recipient })
     }
-    if (args.action === 'list_projects' || args.action === 'get_project') return JSON.stringify(await this.agentApi('GET', sessionId, { signal }))
-    const projectFields = ['name', 'description', 'startDate', 'dueDate']
-    const taskFields = ['title', 'status', 'priority', 'start', 'due', 'progress', 'critical', 'assignees', 'relatedTo', 'checklist', 'body']
-    if (args.action === 'add_task_node') {
-      const taskId = safeText(args.taskId, 'taskId', 100)
-      const kind = safeText(args.kind, '任务节点类型', 16)
-      if (!TASK_NODE_KINDS.has(kind)) fail('任务节点类型必须是 completed、current 或 blocker')
-      const nodeText = safeText(args.nodeText, '节点内容', TASK_NODE_TEXT_MAX)
-      return JSON.stringify(await this.agentApi('POST', sessionId, { signal, body: { action: 'task.node.add', taskId, kind, nodeText } }))
-    }
-    if (args.action === 'update_project') {
-      const patch = pickPatch(args.patch, projectFields, '项目')
-      return JSON.stringify(await this.agentApi('POST', sessionId, { signal, body: { action: 'project.update', patch } }))
-    }
-    if (args.action === 'create_task') {
-      const title = safeText(args.title, '任务标题')
-      const initialPatch = args.patch === undefined ? null : pickPatch(args.patch, taskFields.filter((field) => field !== 'title'), '任务')
-      let result = await this.agentApi('POST', sessionId, { signal, body: { action: 'task.create', title } })
-      if (initialPatch) {
-        const taskId = result.createdTaskId
-        if (typeof taskId !== 'string' || !TASK_ID.test(taskId)) throw new Error('任务已创建，但 Host 未返回新任务 ID，无法应用初始字段')
-        result = await this.agentApi('POST', sessionId, { signal, body: { action: 'task.update', taskId, patch: initialPatch } })
-      }
-      return JSON.stringify(result)
-    }
-    if (args.action === 'update_task') {
-      const taskId = safeText(args.taskId, 'taskId', 100)
-      const patch = pickPatch(args.patch, taskFields, '任务')
-      return JSON.stringify(await this.agentApi('POST', sessionId, { signal, body: { action: 'task.update', taskId, patch } }))
-    }
-    fail('不支持的 Project Hub 对话操作')
+    fail('不支持的飞书/企微集成操作')
   }
 
   async handleScoped(request) {
     try {
       if (request.method === 'GET') {
         const sessionId = safeText(new URL(request.url).searchParams.get('sessionId'), 'sessionId', 100)
-        const { workspace, project } = await this.projectForSession(sessionId, request.signal)
+        const { workspace } = await this.workspaceForSession(sessionId)
+        const projects = await this.listProjects(request.signal, workspace.path)
+        if (projects.length > 1) fail(`工作区 ${workspace.title} 中存在多个旧项目，需先迁移为一项目一工作区`, 409)
+        if (!projects.length) return json({ project: null, projects: [] })
+        const project = await this.readProject(projects[0].id, request.signal, workspace.path)
+        if (project.workspaceId && project.workspaceId !== workspace.id) fail('项目与 DSH 工作区绑定不一致，拒绝访问', 403)
+        if (project.assistantSessionId && !workspace.sessionIds.includes(project.assistantSessionId)) {
+          const foreignOwner = this.ctx.workspaceRegistry.list().some((candidate) => candidate.id !== workspace.id && candidate.sessionIds.includes(project.assistantSessionId))
+          if (foreignOwner) fail('项目助手会话属于其他 DSH 工作区，拒绝访问', 403)
+          project.assistantSessionId = null
+        }
         const ownerFeishuPairing = this.getFeishuPairingStatus(project.assistantSessionId || sessionId, workspace.sessionIds)
         const feishuPairing = sessionId === project.assistantSessionId
           ? ownerFeishuPairing
@@ -2207,6 +2843,11 @@ class ProjectHub extends Service {
       if (body.action === 'project.ensure') {
         const workspaceId = safeText(body.workspaceId, 'workspaceId', 100)
         const project = await this.ensureWorkspaceProject(workspaceId, { name: body.name, sessionId }, request.signal)
+        if (this.bridgeToolScopeActive && project.workspaceId === workspaceId && project.assistantSessionId === sessionId && project.path === '.') {
+          this.projectAssistantSessions.add(sessionId)
+          const agent = this.ctx.agents?.get(sessionId)
+          if (agent?.ctx?.tools?.register) this.ensureProjectHubAgentTools(agent)
+        }
         return json({ project }, 201)
       }
       const { workspace, session, project } = await this.projectForSession(sessionId, request.signal)
@@ -2267,7 +2908,7 @@ class ProjectHub extends Service {
         let binding
         try { binding = this.readStoredFeishuBinding({ sessionId: project.assistantSessionId }) } catch { fail('无法访问系统凭证库中的飞书绑定', 503) }
         if (!binding || binding.projectId !== project.id || binding.workspaceId !== workspace.id) fail('请先在当前项目助手会话完成飞书配对', 409)
-        const pickerUpdated = await this.refreshFeishuProjectPicker({ tenantKey: binding.tenantKey, chatId: binding.chatId, openId: binding.openId, forceNew: true })
+        const pickerUpdated = await this.refreshFeishuProjectPicker({ tenantKey: binding.tenantKey, chatId: binding.chatId, openId: binding.openId })
         if (!pickerUpdated) fail('飞书项目选择卡片未能发送或更新', 503)
         return json({ pickerUpdated: true })
       }

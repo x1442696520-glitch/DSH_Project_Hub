@@ -22,14 +22,24 @@ function safeMessageText(value, label, max) {
   return normalized.trim()
 }
 
+function summarizeApiError(error) {
+  const cause = error?.cause
+  const apiError = cause?.response?.data || cause?.data || cause
+  const code = apiError?.code ?? error?.code
+  const message = typeof apiError?.msg === 'string' ? apiError.msg : typeof cause?.message === 'string' ? cause.message : error?.message
+  const detail = [code != null ? `错误码 ${String(code).slice(0, 64)}` : '', typeof message === 'string' ? message.replace(/[\r\n\u0000-\u001f\u007f]+/g, ' ').slice(0, 300) : ''].filter(Boolean).join('：')
+  return detail
+}
+
 export class FeishuClient {
   #channel
+  #resourceClient
 
   constructor({ appId, appSecret, sdk } = {}) {
     const id = safeText(appId, '飞书 App ID', 128)
     const secret = safeText(appSecret, '飞书 App Secret', 1024)
     const officialSdk = sdk || loadOfficialSdk()
-    if (typeof officialSdk?.createLarkChannel !== 'function') throw new Error('飞书官方 Node.js SDK 不可用')
+    if (typeof officialSdk?.createLarkChannel !== 'function' || typeof officialSdk?.Client !== 'function') throw new Error('飞书官方 Node.js SDK 不可用')
     this.#channel = officialSdk.createLarkChannel({
       appId: id,
       appSecret: secret,
@@ -40,6 +50,7 @@ export class FeishuClient {
       outbound: { retry: { maxAttempts: 3, baseDelayMs: 250 } },
       loggerLevel: officialSdk.LoggerLevel?.error
     })
+    this.#resourceClient = new officialSdk.Client({ appId: id, appSecret: secret, loggerLevel: officialSdk.LoggerLevel?.error })
   }
 
   on(event, listener) {
@@ -63,12 +74,31 @@ export class FeishuClient {
     return this.#channel.getConnectionStatus?.()
   }
 
-  async downloadFile(fileKey) {
+  async downloadFile(fileKey, messageId) {
     const key = safeText(fileKey, '飞书 file_key', 512)
-    if (typeof this.#channel.downloadResource !== 'function') throw new Error('飞书官方 SDK 不支持文件资源下载')
-    const buffer = await this.#channel.downloadResource(key, 'file')
-    if (!(buffer instanceof Uint8Array)) throw new Error('飞书 SDK 返回的文件数据无效')
-    return { buffer }
+    const id = safeText(messageId, '飞书 message_id', 256)
+    const getResource = this.#resourceClient?.im?.v1?.messageResource?.get
+    if (typeof getResource !== 'function') throw new Error('飞书官方 SDK 不支持下载消息中的文件资源')
+    const response = await getResource.call(this.#resourceClient.im.v1.messageResource, {
+      path: { message_id: id, file_key: key },
+      params: { type: 'file' }
+    })
+    const stream = response?.getReadableStream?.()
+    if (!stream || typeof stream[Symbol.asyncIterator] !== 'function') throw new Error('飞书 SDK 返回的文件流无效')
+    const chunks = []
+    let size = 0
+    for await (const chunk of stream) {
+      if (!(chunk instanceof Uint8Array)) throw new Error('飞书 SDK 返回了非二进制文件数据')
+      const bytes = Buffer.from(chunk)
+      size += bytes.byteLength
+      if (size > 50 * 1024 * 1024) {
+        stream.destroy?.()
+        throw new Error('飞书附件超过 50 MiB 的单文件接收上限')
+      }
+      chunks.push(bytes)
+    }
+    if (!size) throw new Error('飞书 SDK 返回了空文件')
+    return { buffer: Buffer.concat(chunks, size) }
   }
 
   async sendText({ chatId, content, replyToMessageId } = {}) {
@@ -85,8 +115,18 @@ export class FeishuClient {
     if (/[\\/]/.test(name)) throw new Error('飞书文件名不能包含路径分隔符')
     if (!(buffer instanceof Uint8Array) || buffer.byteLength === 0 || buffer.byteLength > 20 * 1024 * 1024) throw new Error('飞书发送文件无效或超过 20 MiB 上限')
     const options = replyToMessageId ? { replyTo: safeText(replyToMessageId, '飞书 message_id', 256) } : undefined
-    const result = await this.#channel.send(target, { file: { source: Buffer.from(buffer), fileName: name } }, options)
-    return { sent: true, messageId: result?.messageId || '' }
+    let result
+    try {
+      result = await this.#channel.send(target, { file: { source: Buffer.from(buffer), fileName: name } }, options)
+    } catch (error) {
+      const detail = summarizeApiError(error)
+      const wrapped = new Error(`飞书文件上传/发送失败${detail ? `：${detail}` : ''}`, { cause: error })
+      if (error?.code != null) wrapped.code = error.code
+      throw wrapped
+    }
+    const messageId = typeof result?.messageId === 'string' ? result.messageId.trim() : ''
+    if (!messageId) throw new Error('飞书 SDK 未返回文件消息 ID，不能确认文件已送达')
+    return { sent: true, messageId }
   }
 
   async sendCard({ chatId, card, replyToMessageId } = {}) {
@@ -105,5 +145,12 @@ export class FeishuClient {
     if (typeof this.#channel.updateCard !== 'function') throw new Error('飞书官方 SDK 不支持更新交互卡片')
     await this.#channel.updateCard(id, card)
     return { updated: true, messageId: id }
+  }
+
+  async recallMessage({ messageId } = {}) {
+    const id = safeText(messageId, '飞书 message_id', 256)
+    if (typeof this.#channel.recallMessage !== 'function') throw new Error('飞书官方 SDK 不支持撤回消息')
+    await this.#channel.recallMessage(id)
+    return { recalled: true, messageId: id }
   }
 }

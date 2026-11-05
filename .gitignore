@@ -1,13 +1,22 @@
+# Dependencies
 node_modules/
 .pnpm-store/
+
+# Generated DSH runtime bundle
 lib/
+
+# Keep the public integration guide; omit tests and development material
+docs/*
+!docs/INTEGRATIONS.md
 test/
 tests/
-docs/
 CONTRIBUTING.md
 .github/
+
+# Secrets and local configuration
 .env
 .env.*
+!.env.example
 *.local
 *.pem
 *.p12
@@ -15,4 +24,18 @@ CONTRIBUTING.md
 *.key
 credentials.json
 secrets.json
+
+# Logs, coverage, and test artifacts
 *.log
+npm-debug.log*
+pnpm-debug.log*
+coverage/
+test-results/
+playwright-report/
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
