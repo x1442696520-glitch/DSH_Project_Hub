@@ -20,6 +20,9 @@ function createKeyringEntry(service, account) {
 
 const ROUTE = '/api/project-hub'
 const INTEGRATION_AGENT_ACTIONS = new Set(['list_project_files', 'wecom_send_text', 'wecom_status', 'feishu_status', 'feishu_send_test', 'send_file'])
+const PROJECT_AGENT_ACTIONS = new Set(['agent_tool_status', 'review_code_changes', 'get_project', 'list_tasks', 'create_task', 'update_task', 'add_task_node'])
+// DSH mounts exactly one native shell tool per host platform: Bash off Windows, Pwsh on Windows.
+const STANDARD_DSH_TOOL_NAMES = ['read', 'write', process.platform === 'win32' ? 'pwsh' : 'bash']
 const ROOT = 'projects' // legacy layout, retained only for safe migration
 const PROJECT_FILE = 'project.md'
 const TASKS_DIR = 'tasks'
@@ -174,6 +177,14 @@ function validDate(value) {
   const date = new Date(`${value}T00:00:00Z`)
   return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value
 }
+function localDateString(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+}
+function defaultTaskDates(now = new Date()) {
+  const startDate = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const dueDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1)
+  return { start: localDateString(startDate), due: localDateString(dueDate) }
+}
 function normalizeAssignees(value) {
   if (!Array.isArray(value)) fail('assignees 必须是数组')
   return value.map((person) => {
@@ -223,6 +234,7 @@ function bridgeJournalStageError(error, stage) {
 }
 function bridgeJournalErrorCode(error) {
   if (typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]{0,47}$/.test(error.code)) return error.code
+  if (typeof error?.code === 'string' && /^[a-z][a-z0-9-]*(?:\/[a-z0-9-]+){0,2}$/.test(error.code)) return error.code.toUpperCase().replace(/[^A-Z0-9]+/g, '_').slice(0, 48)
   if (Number.isSafeInteger(error?.status)) return `HOST_${error.status}`
   if (error?.name === 'SyntaxError') return 'SYNTAX_ERROR'
   return typeof error?.name === 'string' && /^[A-Za-z][A-Za-z0-9]{0,39}$/.test(error.name) ? error.name : 'UNKNOWN'
@@ -243,13 +255,17 @@ function pickPatch(value, allowed, label) {
 }
 
 class ProjectHub extends Service {
-  static inject = ['connection', 'fs', 'shell', 'sandboxPolicy', 'workspaceRegistry', 'sessions', 'sessionPersistence', 'agents']
+  static inject = ['connection', 'fs', 'shell', 'sandboxPolicy', 'workspaceRegistry', 'sessions', 'sessionPersistence', 'agents', 'agentPresets']
   ensureProjects = new Map()
   bridgeJournalQueues = new Map()
   bridgeAutoResumeAttempts = new Map()
   bridgeAgentToolDisposers = new Map()
+  agentPresetRestoreAttempts = new Map()
+  agentPresetRestorationStatus = new Map()
+  agentPresetRestoreGeneration = 0
   projectAssistantSessions = new Set()
   bridgeToolScopeActive = false
+  bridgeToolScopeReady = undefined
   bridgeJournalDiagnostics = { lastFailure: null }
   feishuDurableOutbox = new Map()
   feishuOutboxRecoveryRunning = false
@@ -287,13 +303,8 @@ class ProjectHub extends Service {
     ctx.on('session/event', (session, event) => this.handleSessionEvent(session, event))
     ctx.on('agent/created', ({ agent }) => {
       if (!this.bridgeToolScopeActive) return
-      const sessionId = agent?.session?.id || agent?.id
-      if (sessionId && this.projectAssistantSessions.has(sessionId)) {
-        try { this.ensureProjectHubAgentTools(agent) }
-        catch (error) { this.ctx.logger.warn(`project-hub: could not attach the scoped assistant tool (${bridgeJournalErrorCode(error)})`) }
-        return
-      }
-      void this.attachProjectHubToolIfOwned(agent).catch((error) => this.ctx.logger.warn(`project-hub: could not attach the scoped assistant tool (${bridgeJournalErrorCode(error)})`))
+      const restoreGeneration = this.agentPresetRestoreGeneration
+      return this.attachProjectHubToolIfOwned(agent, { expectedGeneration: restoreGeneration }).catch((error) => this.ctx.logger.warn(`project-hub: could not attach the scoped assistant tool (${bridgeJournalErrorCode(error)})`))
     })
     ctx.effect(() => ctx.connection.fetch.register({
       path: ROUTE,
@@ -303,11 +314,16 @@ class ProjectHub extends Service {
     }), 'project-hub: api route')
     ctx.effect(() => {
       this.bridgeToolScopeActive = true
-      void this.attachProjectHubToolsToLiveAgents().catch((error) => this.ctx.logger.warn(`project-hub: could not restore scoped assistant tools (${bridgeJournalErrorCode(error)})`))
+      this.agentPresetRestoreGeneration++
+      this.bridgeToolScopeReady = this.attachProjectHubToolsToLiveAgents()
+      void this.bridgeToolScopeReady.catch((error) => this.ctx.logger.warn(`project-hub: could not restore scoped assistant tools (${bridgeJournalErrorCode(error)})`))
       return () => {
         this.bridgeToolScopeActive = false
+        this.agentPresetRestoreGeneration++
+        this.bridgeToolScopeReady = undefined
         this.disposeBridgeAgentTools()
         this.projectAssistantSessions.clear()
+        this.agentPresetRestorationStatus.clear()
       }
     }, 'project-hub: scoped assistant tools')
     ctx.effect(() => this.startWeComConnection(), 'project-hub: wecom ai bot long connection')
@@ -331,25 +347,187 @@ class ProjectHub extends Service {
     })
   }
 
-  async attachProjectHubToolIfOwned(agent) {
-    if (!this.bridgeToolScopeActive) return
+  createProjectManagementToolDefinition() {
+    return defineTool({
+      name: 'project_hub_manage',
+      description: '管理当前 DSH 会话所属 Workspace 的 Project Hub 项目和任务；可诊断当前 Agent 可见的 DSH 工具名，也可在用户要求时通过沙箱内固定的只读 Git 命令查看工作区状态、差异统计与最近提交。可按用户明确要求创建任务、更新任务或记录完成/当前/阻塞节点；阻塞节点自动将任务设为有阻塞。不得访问其他 Workspace、执行任意命令或臆造审查结果。此工具只作补充，不限制 DSH 原有代码、文件、终端工具。',
+      parameters: {
+        action: { type: 'string', required: true, enum: ['agent_tool_status', 'review_code_changes', 'get_project', 'list_tasks', 'create_task', 'update_task', 'add_task_node'], description: '检查 Agent 当前可见工具，或执行受限的工作区变更/Project Hub 管理操作。' },
+        taskId: { type: 'string', description: '当前项目中的任务 ID。' },
+        title: { type: 'string', description: 'create_task 使用：新任务标题。' },
+        kind: { type: 'string', enum: ['completed', 'current', 'blocker'], description: 'add_task_node 使用：completed=记录已完成事项，current=记录当前进展，blocker=记录阻塞并自动设置 blocked 状态。' },
+        nodeText: { type: 'string', description: 'add_task_node 使用：节点内容，最多 2000 字符。' },
+        patch: { type: 'json', description: 'update_task 使用。仅允许 title、status、priority、start、due、progress、critical、assignees、relatedTo、checklist、body。' }
+      },
+      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+      execute: (args, exec) => this.executeProjectManagementTool(args, exec.signal, exec.agent),
+      presentCall: (args) => ({ card: 'generic', title: 'Project Hub', kind: ['agent_tool_status', 'review_code_changes', 'get_project', 'list_tasks'].includes(args.action) ? 'read' : 'other', rawInput: args })
+    })
+  }
+
+  async attachProjectHubToolIfOwned(agent, { strictPresetRestore = false, expectedGeneration = this.agentPresetRestoreGeneration } = {}) {
+    if (!this.isAgentPresetRestoreGenerationCurrent(expectedGeneration)) return false
     const sessionId = agent?.session?.id || agent?.id
-    if (typeof sessionId !== 'string' || !sessionId) return
+    if (typeof sessionId !== 'string' || !sessionId) return false
     const workspaces = this.ctx.workspaceRegistry.list().filter((workspace) => workspace.sessionIds.includes(sessionId))
-    if (workspaces.length !== 1) return
+    if (workspaces.length !== 1) return false
     const workspace = workspaces[0]
     const projects = await this.listProjects(undefined, workspace.path)
-    if (projects.length !== 1) return
+    if (!this.isAgentPresetRestoreGenerationCurrent(expectedGeneration) || projects.length !== 1) return false
     const project = await this.readProject(projects[0].id, undefined, workspace.path)
-    if (project.workspaceId !== workspace.id || project.assistantSessionId !== sessionId || project.path !== '.') return
-    if (!this.bridgeToolScopeActive) return
+    if (!this.isAgentPresetRestoreGenerationCurrent(expectedGeneration)) return false
+    if (project.workspaceId !== workspace.id || project.assistantSessionId !== sessionId || project.path !== '.') return false
     this.projectAssistantSessions.add(sessionId)
+    if (strictPresetRestore) await this.requireProjectHubAgentPreset(agent, expectedGeneration)
+    else {
+      try { await this.restoreProjectHubAgentPreset(agent, expectedGeneration) }
+      catch (error) { this.ctx.logger.warn(`project-hub: could not verify an existing assistant Agent preset composition (${bridgeJournalErrorCode(error)})`) }
+    }
+    if (!this.isAgentPresetRestoreGenerationCurrent(expectedGeneration)) return false
     this.ensureProjectHubAgentTools(agent)
+    return true
+  }
+
+  isAgentPresetRestoreGenerationCurrent(generation) {
+    return this.bridgeToolScopeActive && generation === this.agentPresetRestoreGeneration
+  }
+
+  assertAgentPresetRestoreGeneration(generation) {
+    if (this.isAgentPresetRestoreGenerationCurrent(generation)) return
+    const error = new Error('Project Hub scoped Agent setup was cancelled because its lifecycle changed')
+    error.code = 'PROJECT_HUB_SCOPE_CHANGED'
+    throw error
+  }
+
+  // Published/live Agents are verification-only. The sole mounting caller passes
+  // mountContext from AgentRegistry.resume while the new Agent is unpublished.
+  async restoreProjectHubAgentPreset(agent, expectedGeneration = this.agentPresetRestoreGeneration, { mountContext } = {}) {
+    this.assertAgentPresetRestoreGeneration(expectedGeneration)
+    const sessionId = agent?.session?.id || agent?.id
+    if (typeof sessionId !== 'string' || !sessionId) return false
+    const generation = expectedGeneration
+    const pending = this.agentPresetRestoreAttempts.get(sessionId)
+    if (pending) {
+      if (pending.agent === agent && pending.generation === generation && pending.mountContext === mountContext) {
+        try {
+          const result = await pending.promise
+          this.assertAgentPresetRestoreGeneration(generation)
+          return result
+        } catch (error) {
+          this.assertAgentPresetRestoreGeneration(generation)
+          throw error
+        }
+      }
+      try { await pending.promise } catch {}
+      this.assertAgentPresetRestoreGeneration(generation)
+      return this.restoreProjectHubAgentPreset(agent, generation, { mountContext })
+    }
+    const attempt = { agent, generation, mountContext, promise: this.composeOrVerifyProjectHubAgentPreset(agent, sessionId, generation, mountContext) }
+    this.agentPresetRestoreAttempts.set(sessionId, attempt)
+    try {
+      const result = await attempt.promise
+      this.assertAgentPresetRestoreGeneration(generation)
+      return result
+    } catch (error) {
+      this.assertAgentPresetRestoreGeneration(generation)
+      throw error
+    } finally { if (this.agentPresetRestoreAttempts.get(sessionId) === attempt) this.agentPresetRestoreAttempts.delete(sessionId) }
+  }
+
+  setAgentPresetRestorationStatus(sessionId, status, generation) {
+    if (!this.isAgentPresetRestoreGenerationCurrent(generation)) return false
+    this.agentPresetRestorationStatus.set(sessionId, status)
+    return true
+  }
+
+  async composeOrVerifyProjectHubAgentPreset(agent, sessionId, generation, mountContext) {
+    this.assertAgentPresetRestoreGeneration(generation)
+    const registry = this.ctx.agentPresets
+    const headerPreset = agent?.session?.header?.agentPreset
+    let agentPreset = typeof headerPreset === 'string' && headerPreset ? headerPreset : null
+    try {
+      const projectedPreset = typeof registry?.presetForSession === 'function' ? await registry.presetForSession(agent?.session) : undefined
+      if (typeof projectedPreset === 'string' && projectedPreset) agentPreset = projectedPreset
+      if (!agentPreset) {
+        this.setAgentPresetRestorationStatus(sessionId, { state: 'not-configured' }, generation)
+        return false
+      }
+      if (!registry) {
+        const error = new Error('DSH Agent preset registry is unavailable')
+        error.code = 'AGENT_PRESET_REGISTRY_UNAVAILABLE'
+        throw error
+      }
+      const agentContext = mountContext || agent?.ctx
+      if (mountContext) {
+        if (typeof registry.mount !== 'function') {
+          const error = new Error('DSH Agent preset mount API is unavailable')
+          error.code = 'AGENT_PRESET_MOUNT_UNAVAILABLE'
+          throw error
+        }
+        await registry.mount(mountContext, agentPreset)
+        this.assertAgentPresetRestoreGeneration(generation)
+      }
+      if (typeof registry.composedPreset !== 'function') {
+        const error = new Error('DSH Agent preset composition cannot be verified')
+        error.code = 'AGENT_PRESET_COMPOSITION_UNAVAILABLE'
+        throw error
+      }
+      const compositionPreset = await registry.composedPreset(agentContext)
+      if (compositionPreset !== agentPreset) {
+        const error = new Error(mountContext
+          ? 'DSH resumed Agent was not composed with its persisted preset'
+          : 'the active Agent composition differs from its persisted preset; a started Session cannot be recomposed in place')
+        error.code = mountContext
+          ? 'AGENT_PRESET_COMPOSITION_MISMATCH'
+          : typeof compositionPreset === 'string' ? 'AGENT_PRESET_SCOPE_MISMATCH' : 'AGENT_PRESET_SCOPE_MISSING'
+        error.compositionPreset = typeof compositionPreset === 'string' ? compositionPreset : null
+        throw error
+      }
+      let requiredToolNames = []
+      if (agentPreset === 'standard') {
+        const toolRegistry = agentContext?.tools
+        const schemas = typeof toolRegistry?.schemas === 'function' ? toolRegistry.schemas(agent) : []
+        const visibleToolNames = Array.isArray(schemas) ? schemas.map((schema) => schema?.name).filter((name) => typeof name === 'string') : []
+        const missingTools = STANDARD_DSH_TOOL_NAMES.filter((name) => !visibleToolNames.includes(name))
+        if (missingTools.length) {
+          const error = new Error(`DSH standard Agent preset is missing ordinary tools: ${missingTools.join(', ')}`)
+          error.code = 'AGENT_PRESET_TOOLS_MISSING'
+          error.missingTools = missingTools
+          error.compositionPreset = compositionPreset
+          throw error
+        }
+        requiredToolNames = STANDARD_DSH_TOOL_NAMES
+      }
+      this.setAgentPresetRestorationStatus(sessionId, { state: 'verified', agentPreset, compositionPreset, requiredToolNames }, generation)
+      return true
+    } catch (error) {
+      this.setAgentPresetRestorationStatus(sessionId, {
+        state: 'failed',
+        agentPreset,
+        code: bridgeJournalErrorCode(error),
+        ...(typeof error?.compositionPreset === 'string' || error?.compositionPreset === null ? { compositionPreset: error.compositionPreset } : {}),
+        ...(Array.isArray(error?.missingTools) ? { missingToolNames: error.missingTools } : {})
+      }, generation)
+      throw error
+    }
+  }
+
+  async requireProjectHubAgentPreset(agent, expectedGeneration = this.agentPresetRestoreGeneration, { mountContext } = {}) {
+    this.assertAgentPresetRestoreGeneration(expectedGeneration)
+    const restored = await this.restoreProjectHubAgentPreset(agent, expectedGeneration, { mountContext })
+    this.assertAgentPresetRestoreGeneration(expectedGeneration)
+    if (restored) return true
+    const error = new Error('live Agent has no persisted Agent preset; strict bridge delivery is disabled')
+    error.code = 'AGENT_PRESET_NOT_CONFIGURED'
+    throw error
   }
 
   async attachProjectHubToolsToLiveAgents() {
+    const restoreGeneration = this.agentPresetRestoreGeneration
+    if (!this.isAgentPresetRestoreGenerationCurrent(restoreGeneration)) return
     const agents = this.ctx.agents?.list?.() || []
-    const results = await Promise.allSettled(agents.map((agent) => this.attachProjectHubToolIfOwned(agent)))
+    const results = await Promise.allSettled(agents.map((agent) => this.attachProjectHubToolIfOwned(agent, { expectedGeneration: restoreGeneration })))
+    if (!this.isAgentPresetRestoreGenerationCurrent(restoreGeneration)) return
     for (const result of results) if (result.status === 'rejected') this.ctx.logger.warn(`project-hub: skipped an Agent while restoring scoped tools (${bridgeJournalErrorCode(result.reason)})`)
   }
 
@@ -358,12 +536,15 @@ class ProjectHub extends Service {
     if (!this.bridgeToolScopeActive) throw new Error('Project Hub tool scope is closing')
     if (typeof sessionId !== 'string' || !sessionId) throw new Error('cannot attach Project Hub tool to an unidentified Agent')
     const registered = this.bridgeAgentToolDisposers.get(sessionId)
-    if (registered?.agent === agent) return
-    if (registered) this.detachBridgeAgentTool(sessionId)
     const tools = agent?.ctx?.tools
+    if (registered?.agent === agent && (typeof tools?.get !== 'function' || (tools.get('project_hub_integrations', agent) && tools.get('project_hub_manage', agent)))) return
+    if (registered) this.detachBridgeAgentTool(sessionId)
     if (typeof tools?.register !== 'function') throw new Error('resumed Agent tool scope is unavailable')
-    if (typeof tools.get === 'function' && tools.get('project_hub_integrations', agent)) return
-    const dispose = tools.register(this.createIntegrationToolDefinition())
+    const disposers = []
+    if (typeof tools.get !== 'function' || !tools.get('project_hub_integrations', agent)) disposers.push(tools.register(this.createIntegrationToolDefinition()))
+    if (typeof tools.get !== 'function' || !tools.get('project_hub_manage', agent)) disposers.push(tools.register(this.createProjectManagementToolDefinition()))
+    if (!disposers.length) return
+    const dispose = () => { for (const unregister of disposers.reverse()) unregister() }
     this.bridgeAgentToolDisposers.set(sessionId, { agent, dispose })
   }
 
@@ -382,11 +563,11 @@ class ProjectHub extends Service {
     }
   }
 
-  detachBridgeAgentTool(sessionId) {
+  detachBridgeAgentTool(sessionId, expectedAgent) {
     const registration = this.bridgeAgentToolDisposers.get(sessionId)
-    if (!registration) return
+    if (!registration || (expectedAgent && registration.agent !== expectedAgent)) return
     try { registration.dispose() } catch (error) { this.ctx.logger.warn(`project-hub: failed to detach an Agent-scoped tool (${bridgeJournalErrorCode(error)})`) }
-    this.bridgeAgentToolDisposers.delete(sessionId)
+    if (this.bridgeAgentToolDisposers.get(sessionId) === registration) this.bridgeAgentToolDisposers.delete(sessionId)
   }
 
   disposeBridgeAgentTools() {
@@ -544,7 +725,9 @@ class ProjectHub extends Service {
     return error
   }
 
-  async resumeBridgeSession(sessionId, platform, binding) {
+  async resumeBridgeSession(sessionId, platform, binding, expectedGeneration = this.agentPresetRestoreGeneration) {
+    try { this.assertAgentPresetRestoreGeneration(expectedGeneration) }
+    catch (cause) { throw this.bridgeAutoResumeFailure('Project Hub 会话集成已卸载或重新初始化；消息未送入 DSH。', cause) }
     const existingSession = this.ctx.sessions.get(sessionId)
     const existingAgent = this.ctx.agents?.get(sessionId)
     if (Boolean(existingSession) !== Boolean(existingAgent)) throw this.bridgeAutoResumeFailure('绑定会话的运行状态不一致；请在 DSH 打开对应助手会话后重试。')
@@ -562,8 +745,11 @@ class ProjectHub extends Service {
     } catch (cause) {
       throw this.bridgeAutoResumeFailure('无法安全验证绑定的 DSH 工作区和项目；消息未送入 DSH。', cause)
     }
+    try { this.assertAgentPresetRestoreGeneration(expectedGeneration) }
+    catch (cause) { throw this.bridgeAutoResumeFailure('Project Hub 会话集成已卸载或重新初始化；消息未送入 DSH。', cause) }
 
     if (!shouldResume) {
+      await this.requireProjectHubAgentPreset(existingAgent, expectedGeneration)
       this.ensureProjectHubAgentTools(existingAgent)
       return
     }
@@ -571,24 +757,45 @@ class ProjectHub extends Service {
     if (typeof resumeRegistry?.resume !== 'function' || !this.ctx.sessionPersistence) throw this.bridgeAutoResumeFailure('当前 DSH Host 未提供会话自动恢复能力；请在 DSH 打开对应助手会话后重试。')
 
     let handle
+    let resumedAgent
     try {
       handle = await resumeRegistry.resume({
         resumeSessionId: sessionId,
         setup: async (agentCtx, agent) => {
+          resumedAgent = agent
+          this.assertAgentPresetRestoreGeneration(expectedGeneration)
           const cwd = agent?.session?.header?.cwd
           if (agent?.session?.id !== sessionId || typeof cwd !== 'string' || !cwd) throw new Error('resumed agent identity or cwd is invalid')
           const resolved = await this.ctx.workspaceRegistry.resolveByPath(cwd)
+          this.assertAgentPresetRestoreGeneration(expectedGeneration)
           if (!resolved || resolved.id !== workspace.id || resolved.path !== workspace.path) throw new Error('resumed agent cwd does not match the bound workspace')
           if (typeof agentCtx?.tools?.register !== 'function') throw new Error('resumed agent tool scope is unavailable')
+          await this.requireProjectHubAgentPreset(agent, expectedGeneration, { mountContext: agentCtx })
+          const activatedAgent = this.ctx.agents?.get(sessionId)
+          if (this.ctx.sessions.get(sessionId) && activatedAgent && activatedAgent !== agent) throw new Error('a UI-activated Agent replaced the partial resume before tool attachment')
           this.ensureProjectHubAgentTools(agent, agentCtx.tools, { validatePreviousTools: true })
         }
       })
+      this.assertAgentPresetRestoreGeneration(expectedGeneration)
     } catch (cause) {
-      this.detachBridgeAgentTool(sessionId)
+      const currentAgent = this.ctx.agents?.get(sessionId)
+      if (this.isAgentPresetRestoreGenerationCurrent(expectedGeneration) && resumedAgent && currentAgent !== resumedAgent) {
+        this.detachBridgeAgentTool(sessionId, resumedAgent)
+      }
       // A UI activation may win the race. Reuse it only after both live registries agree.
-      if (this.ctx.sessions.get(sessionId) && this.ctx.agents?.get(sessionId)?.followup) {
-        this.ensureProjectHubAgentTools(this.ctx.agents.get(sessionId))
-        return
+      const activatedAgent = this.ctx.agents?.get(sessionId)
+      if (this.ctx.sessions.get(sessionId) && activatedAgent?.followup) {
+        try {
+          await this.requireProjectHubAgentPreset(activatedAgent, expectedGeneration)
+          this.ensureProjectHubAgentTools(activatedAgent)
+          return
+        } catch (activationCause) {
+          if (this.isAgentPresetRestoreGenerationCurrent(expectedGeneration) && this.ctx.sessions.get(sessionId) && this.ctx.agents?.get(sessionId) === activatedAgent) {
+            try { this.ensureProjectHubAgentTools(activatedAgent) }
+            catch (attachError) { this.ctx.logger.warn(`project-hub: could not preserve scoped tools on the UI-activated Agent (${bridgeJournalErrorCode(attachError)})`) }
+          }
+          throw this.bridgeAutoResumeFailure('DSH 未能恢复已激活的绑定助手会话；消息未送入 DSH。', activationCause)
+        }
       }
       throw this.bridgeAutoResumeFailure('DSH 未能自动恢复绑定助手会话；消息未送入 DSH，请打开对应助手会话后重发。', cause)
     }
@@ -600,19 +807,44 @@ class ProjectHub extends Service {
     }
     try {
       const { workspace: liveWorkspace, project: liveProject } = await this.projectForSession(sessionId)
+      this.assertAgentPresetRestoreGeneration(expectedGeneration)
       if (liveWorkspace.id !== workspace.id || liveWorkspace.path !== workspace.path || liveProject.id !== project.id || liveProject.workspaceId !== workspace.id || liveProject.assistantSessionId !== sessionId) throw new Error('resumed session no longer matches its bound project')
     } catch (cause) {
       throw this.bridgeAutoResumeFailure('恢复后的会话工作目录或项目绑定不匹配；消息未送入 DSH。', cause)
     }
   }
 
+  async awaitBridgeAutoResumeAttempt(sessionId, platform, expectedGeneration, attempt) {
+    const generation = Number.isInteger(attempt?.generation) ? attempt.generation : -1
+    const promise = attempt?.promise || attempt
+    if (generation === expectedGeneration) return promise
+    try { await promise } catch {}
+    try { this.assertAgentPresetRestoreGeneration(expectedGeneration) }
+    catch (cause) { throw this.bridgeAutoResumeFailure('Project Hub 会话集成已卸载或重新初始化；消息未送入 DSH。', cause) }
+    if (this.bridgeAutoResumeAttempts.get(sessionId) === attempt) this.bridgeAutoResumeAttempts.delete(sessionId)
+    return this.ensureBridgeSessionForInbound(sessionId, platform)
+  }
+
   async ensureBridgeSessionForInbound(sessionId, platform) {
+    const restoreGeneration = this.agentPresetRestoreGeneration
+    try { this.assertAgentPresetRestoreGeneration(restoreGeneration) }
+    catch (cause) { throw this.bridgeAutoResumeFailure('Project Hub 会话集成已卸载或重新初始化；消息未送入 DSH。', cause) }
     const inFlight = this.bridgeAutoResumeAttempts.get(sessionId)
-    if (inFlight) return inFlight
+    if (inFlight) return this.awaitBridgeAutoResumeAttempt(sessionId, platform, restoreGeneration, inFlight)
     const liveSession = this.ctx.sessions.get(sessionId)
     if (liveSession) {
       const liveAgent = this.ctx.agents?.get(sessionId)
-      if (liveAgent && typeof liveAgent.followup === 'function') return
+      if (liveAgent && typeof liveAgent.followup === 'function') {
+        try {
+          if (this.bridgeToolScopeReady) await this.bridgeToolScopeReady
+          this.assertAgentPresetRestoreGeneration(restoreGeneration)
+          const attached = await this.attachProjectHubToolIfOwned(liveAgent, { strictPresetRestore: true, expectedGeneration: restoreGeneration })
+          if (!attached) throw new Error('bound Project Hub tools could not be confirmed for the live Agent')
+        } catch (cause) {
+          throw this.bridgeAutoResumeFailure('无法确认绑定助手的标准工具和 Project Hub 工具；消息未送入 DSH。', cause)
+        }
+        return
+      }
       const error = new Error('DSH 会话仍在运行，但对应 Agent 当前不可用；请打开该助手会话后重发。')
       error.status = 503
       error.code = 'SESSION_AGENT_NOT_ACTIVE'
@@ -639,11 +871,13 @@ class ProjectHub extends Service {
     } catch (cause) {
       throw this.bridgeAutoResumeFailure('无法核验绑定的自动恢复设置；消息未送入 DSH。', cause)
     }
+    try { this.assertAgentPresetRestoreGeneration(restoreGeneration) }
+    catch (cause) { throw this.bridgeAutoResumeFailure('Project Hub 会话集成已卸载或重新初始化；消息未送入 DSH。', cause) }
     const pending = this.bridgeAutoResumeAttempts.get(sessionId)
-    if (pending) return pending
-    const operation = this.resumeBridgeSession(sessionId, platform, binding)
-    this.bridgeAutoResumeAttempts.set(sessionId, operation)
-    try { await operation } finally { if (this.bridgeAutoResumeAttempts.get(sessionId) === operation) this.bridgeAutoResumeAttempts.delete(sessionId) }
+    if (pending) return this.awaitBridgeAutoResumeAttempt(sessionId, platform, restoreGeneration, pending)
+    const attempt = { generation: restoreGeneration, promise: this.resumeBridgeSession(sessionId, platform, binding, restoreGeneration) }
+    this.bridgeAutoResumeAttempts.set(sessionId, attempt)
+    try { await attempt.promise } finally { if (this.bridgeAutoResumeAttempts.get(sessionId) === attempt) this.bridgeAutoResumeAttempts.delete(sessionId) }
   }
 
   async restoreBoundBridgeSessions() {
@@ -2745,9 +2979,101 @@ class ProjectHub extends Service {
     fail('文件发送平台无效', 400)
   }
 
+  async inspectWorkspaceChanges(workspace, session, signal) {
+    if (!this.ctx.shell || typeof this.ctx.shell.resolve !== 'function' || typeof this.ctx.shell.execute !== 'function') fail('DSH 安全 Shell 只读检查服务不可用', 503)
+    signal?.throwIfAborted()
+    const command = 'git status --short; git diff --stat HEAD; git log -5 --oneline --decorate; git show -1 --no-ext-diff --unified=3 --format=fuller --no-renames HEAD; git diff --no-ext-diff --unified=3 HEAD'
+    const sandboxPolicy = this.ctx.sandboxPolicy.resolve({ session })
+    const spec = this.ctx.shell.resolve({ command, workdir: workspace.path, timeoutMs: 30_000, stdoutMaxBytes: 512 * 1024, sandboxPolicy })
+    const execution = await this.ctx.shell.execute(spec)
+    const result = await execution.result()
+    if (result?.timedOut || result?.aborted || result?.sandbox?.denied) fail('只读 Git 检查被超时、取消或沙箱策略拒绝', 403)
+    return {
+      workspacePath: workspace.path,
+      exitCode: Number.isInteger(result?.exitCode) ? result.exitCode : null,
+      stdout: typeof result?.stdout?.text === 'string' ? result.stdout.text : '',
+      stderr: typeof result?.stderr?.text === 'string' ? result.stderr.text : '',
+      truncated: Boolean(result?.stdout?.truncated)
+    }
+  }
+
+  async executeProjectManagementTool(args, signal, agent) {
+    signal?.throwIfAborted()
+    if (!PROJECT_AGENT_ACTIONS.has(args?.action)) fail('不支持的 Project Hub 项目/任务操作', 403)
+    const sessionId = agent?.session?.id
+    if (typeof sessionId !== 'string' || !sessionId) fail('Project Hub 工具必须由 DSH 会话调用', 403)
+    if (args.action === 'agent_tool_status') {
+      // Re-verify live state on demand so diagnostics can clear stale failures after a safe code update.
+      try { await this.restoreProjectHubAgentPreset(agent) } catch {}
+      const registry = agent?.ctx?.tools
+      if (typeof registry?.schemas !== 'function') fail('当前 Agent 没有公开工具 schema 诊断接口', 503)
+      const registeredVisibleToolNames = registry.schemas(agent).map((schema) => schema.name).filter((name) => typeof name === 'string')
+      const presetRegistry = this.ctx.agentPresets
+      let projectedPreset
+      let composedAgentPreset = null
+      try { if (typeof presetRegistry?.presetForSession === 'function') projectedPreset = await presetRegistry.presetForSession(agent?.session) } catch {}
+      try { if (typeof presetRegistry?.composedPreset === 'function') composedAgentPreset = await presetRegistry.composedPreset(agent?.ctx) || null } catch {}
+      const sessionAgentPreset = typeof projectedPreset === 'string' && projectedPreset ? projectedPreset : typeof agent?.session?.header?.agentPreset === 'string' ? agent.session.header.agentPreset : null
+      const missingStandardDshToolNames = sessionAgentPreset === 'standard' ? STANDARD_DSH_TOOL_NAMES.filter((name) => !registeredVisibleToolNames.includes(name)) : null
+      const projectToolNames = new Set(['project_hub_integrations', 'project_hub_manage'])
+      const previousRequestToolNames = (agent?.session?.requestHeader?.()?.tools || []).map((tool) => tool.name).filter((name) => typeof name === 'string')
+      return JSON.stringify({
+        sessionAgentPreset,
+        composedAgentPreset,
+        agentPresetRestoration: this.agentPresetRestorationStatus.get(sessionId) || { state: 'not-checked' },
+        standardPresetToolsReady: missingStandardDshToolNames === null ? null : missingStandardDshToolNames.length === 0,
+        requiredStandardDshToolNames: missingStandardDshToolNames === null ? null : STANDARD_DSH_TOOL_NAMES,
+        missingStandardDshToolNames,
+        previousRequestToolNames,
+        registeredVisibleToolNames,
+        inheritedDshToolNames: registeredVisibleToolNames.filter((name) => !projectToolNames.has(name) && name !== 'run_code'),
+        runCodeTransportRegistered: registeredVisibleToolNames.includes('run_code')
+      })
+    }
+    if (args.action === 'review_code_changes') {
+      const { workspace, session } = await this.projectForSession(sessionId, signal)
+      return JSON.stringify(await this.inspectWorkspaceChanges(workspace, session, signal))
+    }
+    if (args.action === 'get_project') return JSON.stringify(await this.agentApi('GET', sessionId, { signal }))
+    if (args.action === 'list_tasks') {
+      const result = await this.agentApi('GET', sessionId, { signal })
+      const project = result.project
+      const tasks = Array.isArray(project?.tasks) ? project.tasks.map((task) => ({
+        id: task.id,
+        title: task.title,
+        status: task.status,
+        priority: task.priority,
+        due: task.due,
+        progress: task.progress,
+        currentWork: task.currentWork,
+        blocker: task.blocker,
+        nodes: task.nodes
+      })) : []
+      return JSON.stringify({ project: { id: project?.id, name: project?.name, updatedAt: project?.updatedAt }, tasks })
+    }
+    if (args.action === 'create_task') {
+      const title = safeText(args.title, '任务标题')
+      return JSON.stringify(await this.agentApi('POST', sessionId, { signal, body: { action: 'task.create', title } }))
+    }
+    if (args.action === 'add_task_node') {
+      const taskId = safeText(args.taskId, 'taskId', 100)
+      const kind = safeText(args.kind, '任务节点类型', 16)
+      if (!TASK_NODE_KINDS.has(kind)) fail('任务节点类型必须是 completed、current 或 blocker')
+      const nodeText = safeText(args.nodeText, '节点内容', TASK_NODE_TEXT_MAX)
+      return JSON.stringify(await this.agentApi('POST', sessionId, { signal, body: { action: 'task.node.add', taskId, kind, nodeText } }))
+    }
+    if (args.action === 'update_task') {
+      const taskId = safeText(args.taskId, 'taskId', 100)
+      const fields = ['title', 'status', 'priority', 'start', 'due', 'progress', 'critical', 'assignees', 'relatedTo', 'checklist', 'body']
+      const patch = pickPatch(args.patch, fields, '任务')
+      return JSON.stringify(await this.agentApi('POST', sessionId, { signal, body: { action: 'task.update', taskId, patch } }))
+    }
+    fail('不支持的 Project Hub 项目/任务操作')
+  }
+
   async executeAgentTool(args, signal, agent) {
     signal?.throwIfAborted()
-    if (!INTEGRATION_AGENT_ACTIONS.has(args?.action)) fail('该 Agent 工具仅支持飞书/企微集成操作；项目和任务请在 Project Hub 面板管理', 403)
+    if (!INTEGRATION_AGENT_ACTIONS.has(args?.action)) fail('该 Agent 工具仅支持飞书/企微集成操作')
     const sessionId = agent?.session?.id
     if (typeof sessionId !== 'string' || !sessionId) fail('Project Hub 工具必须由 DSH 会话调用', 403)
     if (args.action === 'list_project_files') {
@@ -2792,6 +3118,7 @@ class ProjectHub extends Service {
   }
 
   async handleScoped(request) {
+    const scopeGeneration = this.agentPresetRestoreGeneration
     try {
       if (request.method === 'GET') {
         const sessionId = safeText(new URL(request.url).searchParams.get('sessionId'), 'sessionId', 100)
@@ -2843,10 +3170,14 @@ class ProjectHub extends Service {
       if (body.action === 'project.ensure') {
         const workspaceId = safeText(body.workspaceId, 'workspaceId', 100)
         const project = await this.ensureWorkspaceProject(workspaceId, { name: body.name, sessionId }, request.signal)
-        if (this.bridgeToolScopeActive && project.workspaceId === workspaceId && project.assistantSessionId === sessionId && project.path === '.') {
+        if (this.isAgentPresetRestoreGenerationCurrent(scopeGeneration) && project.workspaceId === workspaceId && project.assistantSessionId === sessionId && project.path === '.') {
           this.projectAssistantSessions.add(sessionId)
           const agent = this.ctx.agents?.get(sessionId)
-          if (agent?.ctx?.tools?.register) this.ensureProjectHubAgentTools(agent)
+          if (agent?.ctx?.tools?.register) {
+            try { await this.restoreProjectHubAgentPreset(agent, scopeGeneration) }
+            catch (error) { this.ctx.logger.warn(`project-hub: could not restore the project assistant Agent preset (${bridgeJournalErrorCode(error)})`) }
+            if (this.isAgentPresetRestoreGenerationCurrent(scopeGeneration)) this.ensureProjectHubAgentTools(agent)
+          }
         }
         return json({ project }, 201)
       }
@@ -2984,9 +3315,15 @@ class ProjectHub extends Service {
       }
       if (body.action === 'task.create') {
         const title = safeText(body.title, '任务标题')
+        const defaults = defaultTaskDates()
+        const start = body.start === undefined ? defaults.start : body.start
+        const due = body.due === undefined ? defaults.due : body.due
+        if (start !== '' && !validDate(start)) fail('start 必须是有效日期 YYYY-MM-DD')
+        if (due !== '' && !validDate(due)) fail('due 必须是有效日期 YYYY-MM-DD')
+        if (start && due && due < start) fail('截止日期不能早于开始日期')
         const id = makeId('t')
         const file = `${TASKS_DIR}/${id}.md`
-        const task = { id, title, status: 'todo', priority: 'normal', assignees: [], start: '', due: '', progress: 0, estimate: null, critical: false, relatedTo: [], checklist: [], nodes: [] }
+        const task = { id, title, status: 'todo', priority: 'normal', assignees: [], start, due, progress: 0, estimate: null, critical: false, relatedTo: [], checklist: [], nodes: [] }
         await this.writeFile(file, serializeDocument(task, '## 任务说明\n\n补充任务描述与验收条件。'), request.signal, workspaceRoot, sandboxPolicy)
         await this.touchProject(projectId, request.signal, workspaceRoot, sandboxPolicy)
         return json({ project: await this.readProject(projectId, request.signal, workspaceRoot), createdTaskId: id }, 201)

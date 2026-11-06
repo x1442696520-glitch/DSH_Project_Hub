@@ -61,6 +61,10 @@ window.__ModuleLoader__.load({
     }
     const isoDay = (date) => date.toISOString().slice(0, 10)
     const localDay = (date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+    const defaultTaskDates = () => {
+      const today = new Date()
+      return { start: localDay(today), due: localDay(new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1)) }
+    }
     const dayNumber = (date) => Math.floor(date.getTime() / 86400000)
     const fromDayNumber = (day) => new Date(day * 86400000)
     const shiftDate = (value, days) => {
@@ -666,7 +670,7 @@ window.__ModuleLoader__.load({
         event.preventDefault()
         if (!taskName.trim() || !activeId) return
         try {
-          const result = await scopedRequest(API, { method: 'POST', body: JSON.stringify({ action: 'task.create', projectId: activeId, title: taskName }) })
+          const result = await scopedRequest(API, { method: 'POST', body: JSON.stringify({ action: 'task.create', projectId: activeId, title: taskName, ...defaultTaskDates() }) })
           setTaskName(''); setShowTaskInput(false); await applyProject(result.project)
         } catch (e) { setError(e.message) }
       }
@@ -707,6 +711,13 @@ window.__ModuleLoader__.load({
         finally { setNormalizing(false) }
       }
 
+      const openAssistantSession = async () => {
+        const assistantSessionId = project?.assistantSessionId
+        if (!assistantSessionId || !onOpenSession) return
+        setError('')
+        try { await onOpenSession(assistantSessionId) }
+        catch (failure) { setError(`打开项目助手会话失败：${failure?.message || String(failure)}`) }
+      }
       const wecomPairing = project?.wecomPairing || { state: 'unbound' }
       const feishuPairing = project?.feishuPairing || { state: 'unbound' }
       const renderIntegrations = () => h('div', { className: 'ph-integrations' },
@@ -754,7 +765,7 @@ window.__ModuleLoader__.load({
             wecomPairing.state === 'error' && h('p', { role: 'alert' }, wecomPairing.label),
             h('button', { type: 'button', className: 'ph-btn small primary', disabled: !project.assistantSessionId || project.wecomConnection?.state !== 'connected' || wecomPairingBusy, onClick: startWeComPairing }, wecomPairingBusy ? '处理中…' : wecomPairing.state === 'bound' ? '重新配对 UserID' : wecomPairing.state === 'bound-elsewhere' ? '迁移绑定到当前会话' : '生成我的单聊配对码'),
             wecomPairing.state === 'bound' && h('button', { type: 'button', className: 'ph-btn small', disabled: wecomPairingBusy, onClick: clearWeComPairing }, '解除 UserID 绑定'),
-            h('button', { type: 'button', className: 'ph-btn small', disabled: !project.assistantSessionId, onClick: () => onOpenSession?.(project.assistantSessionId) }, '打开项目助手会话')
+            h('button', { type: 'button', className: 'ph-btn small', disabled: !project.assistantSessionId, onClick: openAssistantSession }, '打开项目助手会话')
           ),
           h('p', { className: 'ph-muted' },
             '单聊测试目标是企业通讯录成员的 UserID（不是昵称或手机号）。建议使用上方一次性配对自动识别；如需手工查询，请管理员在企业微信管理后台通讯录成员详情中查找，或查看 ',
@@ -807,7 +818,7 @@ window.__ModuleLoader__.load({
             feishuPairing.state === 'bound' && h('button', { type: 'button', className: 'ph-btn small', disabled: feishuPairingBusy, onClick: sendFeishuTestMessage }, feishuPairingBusy ? '发送中…' : '发送飞书测试消息'),
             feishuPairing.state === 'bound' && h('button', { type: 'button', className: 'ph-btn small', disabled: feishuPairingBusy, onClick: clearFeishuPairing }, '解除飞书绑定'),
             feishuNotice && h('p', { role: 'status' }, feishuNotice),
-            h('button', { type: 'button', className: 'ph-btn small', style: { marginTop: 8 }, disabled: !project.assistantSessionId, onClick: () => onOpenSession?.(project.assistantSessionId) }, '打开项目助手会话')
+            h('button', { type: 'button', className: 'ph-btn small', style: { marginTop: 8 }, disabled: !project.assistantSessionId, onClick: openAssistantSession }, '打开项目助手会话')
           )
         ) : activeIntegration === 'wechat' ? h('section', { id: 'ph-integration-panel-wechat', className: 'ph-integration-panel' },
           h('h3', null, '微信连接'), h('div', { className: 'ph-notice' }, '微信连接能力尚未实现；此模块暂用于后续评估入口。')
@@ -841,6 +852,24 @@ window.__ModuleLoader__.load({
         if (!name || name.length > 100 || /[<>:\x2f\x5c|?*\x00-\x1f]/.test(name) || /[. ]$/.test(name) || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i.test(name)) throw new Error('工作区名称不能为空，且不能包含 Windows 路径非法字符或保留名称')
         return name
       }
+      let sessionCatalogRefresh = null
+      const refreshSessionCatalog = () => {
+        if (sessionCatalogRefresh) return sessionCatalogRefresh
+        if (typeof ctx.sessions?.refresh !== 'function') return Promise.reject(new Error('当前 DSH Client 不支持刷新会话列表'))
+        const current = Promise.resolve().then(() => ctx.sessions.refresh())
+        sessionCatalogRefresh = current
+        const cleanup = current.finally(() => { if (sessionCatalogRefresh === current) sessionCatalogRefresh = null })
+        cleanup.catch(() => {})
+        return current
+      }
+      const openProjectAssistantSession = async (assistantSessionId) => {
+        if (typeof assistantSessionId !== 'string' || !assistantSessionId) throw new Error('项目资料没有绑定助手会话 ID')
+        await refreshSessionCatalog()
+        const snapshot = ctx.sessions.list?.getSnapshot?.()
+        if (!snapshot?.byId?.[assistantSessionId]) throw new Error(`DSH 会话列表刷新后仍未返回助手会话 ${assistantSessionId}；项目资料仍保留此会话绑定。`)
+        ctx.uiWorkspace.openSession(assistantSessionId)
+      }
+      void refreshSessionCatalog().catch((error) => globalThis.console?.warn?.('project-hub: DSH session-list refresh failed', error))
       const ensureProjectFilesDirectory = async (workspacePath) => {
         await ensureDirectory(workspacePath, 'files')
       }
@@ -918,7 +947,15 @@ window.__ModuleLoader__.load({
           newWorkspaceId = created.workspace?.workspaceId || created.workspace?.id
           if (!newWorkspaceId) throw new Error('DSH 未返回新 Workspace ID')
           unwrapRemote(await ctx.remote.workspace.rename({ workspaceId: newWorkspaceId, title }))
-          newSessionId = await ctx.sessions.create({ workspaceId: newWorkspaceId })
+          const sourceAgentPreset = await ctx.sessions.using(currentSessionId, { source: 'projectHubWorkspaceMigration' }, (reference) => reference.binding.session.header?.agentPreset)
+          // The Web ISessions.create API accepts agentPreset at the top level and maps it to Session metadata.
+          const createSessionOptions = { workspaceId: newWorkspaceId }
+          if (typeof sourceAgentPreset === 'string' && sourceAgentPreset) createSessionOptions.agentPreset = sourceAgentPreset
+          newSessionId = await ctx.sessions.create(createSessionOptions)
+          if (typeof sourceAgentPreset === 'string' && sourceAgentPreset) {
+            const createdAgentPreset = await ctx.sessions.using(newSessionId, { source: 'projectHubWorkspaceMigrationVerify' }, (reference) => reference.binding.session.header?.agentPreset)
+            if (createdAgentPreset !== sourceAgentPreset) throw new Error('新项目助手 Session 未保留原会话的 Agent preset（工具与提示配置），已中止迁移以避免静默改变会话能力')
+          }
           unwrapRemote(await ctx.remote.session.rename({ sessionId: newSessionId, title: `${title} · 项目助手` }))
           const initialized = await request(API, { method: 'POST', body: JSON.stringify({ action: 'project.ensure', workspaceId: newWorkspaceId, sessionId: newSessionId, name: title }) })
           let newProject = initialized.project
@@ -929,7 +966,7 @@ window.__ModuleLoader__.load({
           const copiedTasks = []
           for (const oldTask of oldProject.tasks || []) {
             const previousIds = new Set(newProject.tasks.map((task) => task.id))
-            const createdTask = await request(API, { method: 'POST', body: JSON.stringify({ action: 'task.create', sessionId: newSessionId, projectId: newProject.id, title: oldTask.title }) })
+            const createdTask = await request(API, { method: 'POST', body: JSON.stringify({ action: 'task.create', sessionId: newSessionId, projectId: newProject.id, title: oldTask.title, start: oldTask.start || '', due: oldTask.due || '' }) })
             newProject = createdTask.project
             const nextTask = newProject.tasks.find((task) => !previousIds.has(task.id))
             if (!nextTask) throw new Error(`迁移任务失败：${oldTask.title}`)
@@ -973,7 +1010,7 @@ window.__ModuleLoader__.load({
       const View = ({ sessionId }) => {
         const workspace = ctx.workspaces.list.getSnapshot().items.find((candidate) => candidate.sessionIds?.includes(sessionId))
         const workspaceId = workspace?.workspaceId || workspace?.id || ''
-        return h(ProjectManagementView, { sessionId, workspaceId, workspacePath: workspace?.path || '', workspaceTitle: workspace?.title || '', onOpenSession: (assistantSessionId) => ctx.uiWorkspace.openSession(assistantSessionId), onInitializeWorkspace: initializeWorkspaceProject, onSendFiles: (currentSessionId, project, paths) => sendProjectFiles(currentSessionId, project, paths), onEnsureFiles: ensureProjectFilesDirectory, onNormalizeWorkspace: (currentSessionId, project, path, title) => normalizeWorkspaceDirectory(currentSessionId, project, path, title) })
+        return h(ProjectManagementView, { sessionId, workspaceId, workspacePath: workspace?.path || '', workspaceTitle: workspace?.title || '', onOpenSession: openProjectAssistantSession, onInitializeWorkspace: initializeWorkspaceProject, onSendFiles: (currentSessionId, project, paths) => sendProjectFiles(currentSessionId, project, paths), onEnsureFiles: ensureProjectFilesDirectory, onNormalizeWorkspace: (currentSessionId, project, path, title) => normalizeWorkspaceDirectory(currentSessionId, project, path, title) })
       }
       ctx.slots.inject('conversation.view', () => ctx.slots.register({ name: 'conversation.view', id: PANEL_ID, order: 20, label: () => '项目', inject: (sessionId) => ({ sessionId }) }, View))
     }

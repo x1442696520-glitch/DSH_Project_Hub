@@ -6,9 +6,9 @@ DSH 插件：在当前 Workspace 中管理项目资料、任务和文件，并�
 
 ## 功能
 
-- **一 Workspace 一个项目**：使用 Workspace 根目录的 `project.md`、`tasks/` 和 `files/`；首次使用时需在当前 Workspace 的 Project Hub 面板中明确点击初始化，复用当前会话。插件启动不会在其他 Workspace 创建或写入项目；为恢复已打开项目助手的专属工具，Host 只读核对活动 Agent 的 Workspace/项目归属。普通启动和当前 Workspace 初始化不会自动创建、重命名 DSH Session，也不会给会话注入欢迎提示。绑定的项目助手会话只额外注册 `project_hub_integrations` 这一飞书/企微集成工具，不做全局注册、不注入项目管理工具或项目角色提示，也不替换 DSH 原有工具；项目和任务仍由面板管理。恢复时按最近持久化请求恢复 `run_code`/PTC 模式，并校验历史工具。
-- **目录迁移边界**：仅在用户确认后创建新的 DSH Workspace 和项目助手 Session；旧 Workspace 保留为备份，不会删除，其他文件和 `files/` 附件不会自动复制或合并。
-- **项目视图**：概览、任务看板和甘特图；支持任务状态、负责人、进度、项目周期和任务时间调整。
+- **一 Workspace 一个项目**：使用 Workspace 根目录的 `project.md`、`tasks/` 和 `files/`；首次使用时需在当前 Workspace 的 Project Hub 面板中明确点击初始化，复用当前会话。插件启动不会在其他 Workspace 创建或写入项目；为恢复已打开项目助手的专属工具，Host 只读核对活动 Agent 的 Workspace/项目归属。普通启动和当前 Workspace 初始化不会自动创建、重命名 DSH Session，也不会给会话注入欢迎提示。绑定的项目助手会话按作用域额外注册 `project_hub_integrations`（飞书/企微）和 `project_hub_manage`（当前 Agent 的 DSH 工具清单诊断、当前 Workspace 的只读 Git 变更检查、项目/任务查看与按用户要求记录）工具；两者不做全局注册、不注入项目角色提示，也不限制或替换 DSH 原有代码、文件和终端工具。项目/任务仍由面板管理，Agent 可在用户明确要求时新增任务或记录节点/阻塞。恢复时按最近持久化请求恢复 `run_code`/PTC 模式，并校验历史工具。
+- **目录迁移边界**：仅在用户确认后创建新的 DSH Workspace 和项目助手 Session；新 Session 继承原 Session 的 Agent preset（工具与提示配置），并校验继承结果，避免静默改变会话能力。旧 Workspace 保留为备份，不会删除，其他文件和 `files/` 附件不会自动复制或合并。
+- **项目视图**：概览、任务看板和甘特图；新建任务默认从本地当日开始、次日截止；支持任务状态、负责人、进度、项目周期和任务时间调整。
 - **项目文件**：仅浏览当前 Workspace 的 `files/`；支持安全路径校验、受限文件读写和发送文件给已绑定的企业微信/飞书私聊。
 - **CSV 导出**：导出适用于 Excel 和飞书表格的 UTF-8 CSV，并防范公式注入。
 - **企业微信 AI Bot**：通过官方 SDK 的 WebSocket 长连接接收获准单聊消息；支持配对、文本投递和文件保存。可单独开启回复同步；已绑定的助手会在收到消息时自动恢复。
@@ -16,8 +16,6 @@ DSH 插件：在当前 Workspace 中管理项目资料、任务和文件，并�
 - **文件处理边界**：收到的企微/飞书附件保存到项目 Workspace 的 `files/`，默认**不会读取文件内容或自动发给模型**。目前代码设置了每个入站文件最大 50 MiB、单条飞书消息最多 5 个文件且总计不超过 100 MiB；向机器人发送文件的插件上限为 20 MiB。平台本身可能另有规则。
 
 群聊接入、读取聊天历史以及读取或修改云文档/表格不属于当前支持范围。普通个人微信号机器人接入也未实现。
-
-连接器配置与权限边界见 [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md)。
 
 ## 运行要求
 
@@ -36,6 +34,7 @@ pnpm run build
 ```
 
 然后在 DSH 插件管理界面选择「安装本地目录」，指向克隆后的仓库目录，并启用 `dsh-project-hub`。每次更新插件后重新运行 `pnpm run build`，再从插件管理界面重新加载插件。
+
 
 ## 机器人凭证
 
@@ -67,4 +66,3 @@ pnpm run build
 ## 许可证
 
 本项目按 [MIT License](LICENSE) 授权。依赖项各自的许可证仍然适用。
-
