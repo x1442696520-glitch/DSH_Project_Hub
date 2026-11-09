@@ -101,3 +101,4 @@ export class WeComAIBotClient {
     return this.replyStream(frame, this.createStreamId(), content, true)
   }
 }
+

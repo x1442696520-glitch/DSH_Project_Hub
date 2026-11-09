@@ -74,9 +74,11 @@ export class FeishuClient {
     return this.#channel.getConnectionStatus?.()
   }
 
-  async downloadFile(fileKey, messageId) {
+  async downloadFile(fileKey, messageId, { maxBytes = 50 * 1024 * 1024 } = {}) {
     const key = safeText(fileKey, '飞书 file_key', 512)
     const id = safeText(messageId, '飞书 message_id', 256)
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new Error('飞书附件大小限制无效')
+    const byteLimit = Math.min(50 * 1024 * 1024, maxBytes)
     const getResource = this.#resourceClient?.im?.v1?.messageResource?.get
     if (typeof getResource !== 'function') throw new Error('飞书官方 SDK 不支持下载消息中的文件资源')
     const response = await getResource.call(this.#resourceClient.im.v1.messageResource, {
@@ -89,13 +91,16 @@ export class FeishuClient {
     let size = 0
     for await (const chunk of stream) {
       if (!(chunk instanceof Uint8Array)) throw new Error('飞书 SDK 返回了非二进制文件数据')
-      const bytes = Buffer.from(chunk)
-      size += bytes.byteLength
-      if (size > 50 * 1024 * 1024) {
-        stream.destroy?.()
-        throw new Error('飞书附件超过 50 MiB 的单文件接收上限')
+      size += chunk.byteLength
+      if (size > byteLimit) {
+        try { stream.destroy?.() } catch {}
+        try { await stream.cancel?.() } catch {}
+        const exceedsMessageLimit = maxBytes < 50 * 1024 * 1024
+        const error = new Error(exceedsMessageLimit ? '飞书消息附件超过剩余总接收上限' : '飞书附件超过 50 MiB 的单文件接收上限')
+        error.code = exceedsMessageLimit ? 'MESSAGE_FILES_TOO_LARGE' : 'FILE_TOO_LARGE'
+        throw error
       }
-      chunks.push(bytes)
+      chunks.push(Buffer.from(chunk))
     }
     if (!size) throw new Error('飞书 SDK 返回了空文件')
     return { buffer: Buffer.concat(chunks, size) }
@@ -154,3 +159,4 @@ export class FeishuClient {
     return { recalled: true, messageId: id }
   }
 }
+
