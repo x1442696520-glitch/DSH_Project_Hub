@@ -4,6 +4,11 @@
   "description": "Workspace-scoped project management and messaging integrations for DeepSeek Harness",
   "private": true,
   "type": "module",
+  "files": [
+    "lib/",
+    "cordis.patch.yml",
+    "scripts/doctor.mjs"
+  ],
   "engines": {
     "node": ">=20"
   },
@@ -14,7 +19,8 @@
     "./cordis.patch.yml": "./cordis.patch.yml"
   },
   "scripts": {
-    "build": "node build.mjs"
+    "build": "node build.mjs",
+    "doctor": "node scripts/doctor.mjs"
   },
   "dsh": {
     "bundle": {

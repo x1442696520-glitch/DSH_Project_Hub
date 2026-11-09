@@ -76,12 +76,59 @@ window.__ModuleLoader__.load({
         const result = await ctx.sessions.using(assistantSessionId, { source: 'projectHubFileSelection' }, (reference) => reference.binding.session.prompt(content, 'queue'))
         if (!result?.ok) throw new Error(result?.error?.message || '项目文件未能发送给项目助手')
       }
+      const previewWorkspaceNormalization = async (currentSessionId, displayedProject, workspacePath, workspaceTitle) => {
+        const workspace = ctx.workspaces.list.getSnapshot().items.find((candidate) => candidate.sessionIds?.includes(currentSessionId))
+        const workspaceId = workspace?.workspaceId || workspace?.id
+        if (!workspaceId || !workspacePath || !workspaceTitle) throw new Error('无法确定当前 Workspace 身份或路径')
+        const title = safeWorkspaceTitle(workspaceTitle)
+        const workspacePathText = String(workspacePath)
+        const workspaceDirectoryName = workspacePathText.replace(/[\\/]+$/, '').split(/[\\/]/).at(-1)
+        const isWindowsPath = /^[a-z]:[\\/]/i.test(workspacePathText) || workspacePathText.startsWith('\\\\')
+        if (workspaceDirectoryName === title || (isWindowsPath && workspaceDirectoryName?.toLocaleLowerCase() === title.toLocaleLowerCase())) {
+          return { alreadyNormalized: true, sourcePath: workspacePathText, targetPath: workspacePathText, projectName: title, taskCount: 0, taskNodeCount: 0 }
+        }
+        const current = await request(`${API}?sessionId=${encodeURIComponent(currentSessionId)}`)
+        const project = current.project || displayedProject
+        if (!project?.id) throw new Error('无法读取待迁移的项目资料')
+        const normalized = workspacePathText.replace(/[\\/]+$/, '')
+        const separatorIndex = Math.max(normalized.lastIndexOf('/'), normalized.lastIndexOf('\\'))
+        let parentPath = separatorIndex < 0 ? '' : normalized.slice(0, separatorIndex)
+        if (/^[a-z]:$/i.test(parentPath)) parentPath += normalized.includes('\\') ? '\\' : '/'
+        if (!parentPath) throw new Error('无法确定 Workspace 的父目录')
+        const siblingListing = unwrapRemote(await ctx.remote.directoryPicker.list(parentPath))
+        const normalizePathForComparison = (value) => {
+          const normalizedPath = String(value || '').replace(/[\\/]+$/, '').replace(/\\/g, '/')
+          return /^[a-z]:\//i.test(normalizedPath) ? normalizedPath.toLocaleLowerCase() : normalizedPath
+        }
+        const currentWorkspacePath = normalizePathForComparison(workspacePathText)
+        const conflictingDirectory = (siblingListing.entries || []).find((entry) =>
+          entry.name.toLocaleLowerCase() === title.toLocaleLowerCase() && normalizePathForComparison(entry.path) !== currentWorkspacePath
+        )
+        if (conflictingDirectory) throw new Error(`同名目录「${title}」已存在：${conflictingDirectory.path}`)
+        const conflictingWorkspace = ctx.workspaces.list.getSnapshot().items.find((candidate) => (candidate.workspaceId || candidate.id) !== workspaceId && String(candidate.title || '').trim().toLocaleLowerCase() === title.toLocaleLowerCase())
+        if (conflictingWorkspace) throw new Error(`已有同名 Workspace「${title}」，无法规范化目录`)
+        const separator = normalized.includes('\\') ? '\\' : '/'
+        const targetPath = `${parentPath.replace(/[\\/]+$/, '')}${separator}${title}`
+        const tasks = Array.isArray(project.tasks) ? project.tasks : []
+        return {
+          alreadyNormalized: false,
+          sourcePath: workspacePathText,
+          targetPath,
+          projectName: project.name || title,
+          taskCount: tasks.length,
+          taskNodeCount: tasks.reduce((total, task) => total + (Array.isArray(task.nodes) ? task.nodes.length : 0), 0)
+        }
+      }
       const normalizeWorkspaceDirectory = async (currentSessionId, displayedProject, workspacePath, workspaceTitle) => {
         const workspace = ctx.workspaces.list.getSnapshot().items.find((candidate) => candidate.sessionIds?.includes(currentSessionId))
         const workspaceId = workspace?.workspaceId || workspace?.id
         if (!workspaceId || !workspacePath || !workspaceTitle) throw new Error('无法确定当前 Workspace 身份或路径')
         const title = safeWorkspaceTitle(workspaceTitle)
-        if (workspacePath.split(/[\\/]/).at(-1) === title) return
+        const workspacePathText = String(workspacePath)
+        const workspaceDirectoryName = workspacePathText.replace(/[\\/]+$/, '').split(/[\\/]/).at(-1)
+        const isWindowsPath = /^[a-z]:[\\/]/i.test(workspacePathText) || workspacePathText.startsWith('\\\\')
+        // Windows resolves case-only path variants to the same directory; migrating would try to recreate that existing directory.
+        if (workspaceDirectoryName === title || (isWindowsPath && workspaceDirectoryName?.toLocaleLowerCase() === title.toLocaleLowerCase())) return
         const current = await request(`${API}?sessionId=${encodeURIComponent(currentSessionId)}`)
         const oldProject = current.project || displayedProject
         if (!oldProject?.id) throw new Error('无法读取待迁移的项目资料')
@@ -183,11 +230,10 @@ window.__ModuleLoader__.load({
       const View = ({ sessionId }) => {
         const workspace = ctx.workspaces.list.getSnapshot().items.find((candidate) => candidate.sessionIds?.includes(sessionId))
         const workspaceId = workspace?.workspaceId || workspace?.id || ''
-        return h(ProjectManagementView, { sessionId, workspaceId, workspacePath: workspace?.path || '', workspaceTitle: workspace?.title || '', onOpenSession: openProjectAssistantSession, onInitializeWorkspace: initializeWorkspaceProject, onSendFiles: (currentSessionId, project, paths) => sendProjectFiles(currentSessionId, project, paths), onEnsureFiles: ensureProjectFilesDirectory, onNormalizeWorkspace: (currentSessionId, project, path, title) => normalizeWorkspaceDirectory(currentSessionId, project, path, title) })
+        return h(ProjectManagementView, { sessionId, workspaceId, workspacePath: workspace?.path || '', workspaceTitle: workspace?.title || '', onOpenSession: openProjectAssistantSession, onInitializeWorkspace: initializeWorkspaceProject, onSendFiles: (currentSessionId, project, paths) => sendProjectFiles(currentSessionId, project, paths), onEnsureFiles: ensureProjectFilesDirectory, onPreviewNormalizeWorkspace: (currentSessionId, project, path, title) => previewWorkspaceNormalization(currentSessionId, project, path, title), onNormalizeWorkspace: (currentSessionId, project, path, title) => normalizeWorkspaceDirectory(currentSessionId, project, path, title) })
       }
       ctx.slots.inject('conversation.view', () => ctx.slots.register({ name: 'conversation.view', id: PANEL_ID, order: 20, label: () => '项目', inject: (sessionId) => ({ sessionId }) }, View))
     }
     return { apply, inject: ['slots', 'remote', 'remote.directoryPicker', 'remote.workspace', 'remote.session', 'fileUpload', 'sessions', 'uiWorkspace', 'workspaces'] }
   }
 })
-

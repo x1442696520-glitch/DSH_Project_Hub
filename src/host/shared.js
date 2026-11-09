@@ -13,10 +13,14 @@ try {
 }
 
 export function createKeyringEntry(service, account) {
-  if (typeof KeyringEntry !== 'function') {
+  if (!isCredentialStoreAvailable()) {
     throw new Error('系统凭证库原生模块不可用；请重新安装插件依赖，或改用 Host 环境变量配置机器人凭证')
   }
   return new KeyringEntry(service, account)
+}
+
+export function isCredentialStoreAvailable() {
+  return typeof KeyringEntry === 'function'
 }
 
 export const ROUTE = '/api/project-hub'
@@ -118,6 +122,12 @@ export function failWithCode(message, status, code) {
 export function safeText(value, label, max = 200) {
   if (typeof value !== 'string' || !value.trim() || value.length > max) fail(`${label}不能为空且最多 ${max} 个字符`)
   return value.trim()
+}
+export function isWeComRecipientAuthorized(recipient, sessionId, binding, env = globalThis.process?.env || {}) {
+  if (binding?.sessionId === sessionId && binding.userId === recipient) return true
+  const configuredSessionId = typeof env.WECOM_DSH_SESSION_ID === 'string' ? env.WECOM_DSH_SESSION_ID.trim() : ''
+  const allowedUsers = String(env.WECOM_ALLOWED_USER_IDS || '').split(',').map((value) => value.trim()).filter(Boolean)
+  return configuredSessionId === sessionId && allowedUsers.includes(recipient)
 }
 export function textBlocksText(content) {
   return Array.isArray(content) ? content.filter((block) => block?.type === 'text' && typeof block.text === 'string').map((block) => block.text).join('').trim() : ''
@@ -255,4 +265,3 @@ export function pickPatch(value, allowed, label) {
   if (!Object.keys(value).length) fail(`${label} patch 不能为空`)
   return value
 }
-

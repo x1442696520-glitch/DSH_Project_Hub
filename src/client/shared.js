@@ -9,6 +9,7 @@ window.__ModuleLoader__.load({
     const statusColors = { todo: 'var(--ph-text-tertiary)', doing: 'var(--ph-accent)', blocked: 'var(--ph-danger)', done: 'var(--ph-success)' }
     const taskNodeNames = { completed: '完成事项', current: '当前事项', blocker: '阻塞卡点' }
     const priorityNames = { low: '低', normal: '普通', high: '高', urgent: '紧急' }
+    const projectCsvHeaders = ['项目名称', '项目简介', '项目开始日期', '项目截止日期', '任务 ID', '任务名称', '状态', '优先级', '关键任务', '进度（%）', '任务开始日期', '任务截止日期', '负责人', '当前事项', '阻塞卡点', '任务节点记录', '任务说明']
     const officePlatforms = [
       { id: 'wecom', name: '企业微信', desc: '智能机器人 API 模式：Host 通过官方 WebSocket 长连接收发消息，无需公网回调。', priority: true, status: '长连接状态待检查' },
       { id: 'feishu', name: '飞书', desc: '官方 SDK 长连接：授权私聊文本投递到助手；项目文件可按要求发送到绑定私聊。', priority: true, status: '长连接状态待检查' },
@@ -18,6 +19,7 @@ window.__ModuleLoader__.load({
     const css = `
       .ph-root{--ph-bg:var(--dsw-alias-bg-base,#fff);--ph-surface:var(--dsw-alias-bg-layer-1,var(--ph-bg));--ph-surface-alt:var(--dsw-alias-bg-layer-2,var(--ph-bg));--ph-text-primary:var(--dsw-alias-label-primary,#182230);--ph-text-secondary:var(--dsw-alias-label-secondary,#596579);--ph-text-tertiary:var(--dsw-alias-label-tertiary,#778496);--ph-text-caption:var(--dsw-alias-label-caption,#919aa8);--ph-border:var(--dsw-alias-border-l2,#dfe5ee);--ph-border-strong:var(--dsw-alias-border-l3,var(--ph-border));--ph-accent:var(--dsw-alias-state-business-primary,var(--dsw-alias-brand-primary,#2563eb));--ph-accent-soft:var(--dsw-alias-state-business-tertiary,var(--dsw-alias-bg-layer-2,#eef3ff));--ph-hover:var(--dsw-alias-interactive-bg-hover,var(--ph-surface-alt));--ph-danger:var(--dsw-alias-state-error-primary,#ac3028);--ph-danger-soft:var(--dsw-alias-state-error-tertiary,var(--ph-surface-alt));--ph-warn:var(--dsw-alias-state-warn-label,var(--dsw-alias-state-warn-primary,#815000));--ph-warn-soft:var(--dsw-alias-state-warn-tertiary,var(--ph-surface-alt));--ph-success:var(--dsw-alias-state-success-primary,#18713d);--ph-success-soft:var(--dsw-alias-state-success-tertiary,var(--ph-surface-alt));height:100%;min-height:0;background:var(--ph-bg);color:var(--ph-text-primary);font-family:var(--dsw-font-family,system-ui,sans-serif);font-size:var(--dsh-content-font-size,14px);line-height:calc(24px + var(--dsh-content-font-delta,0px));display:flex;overflow:hidden}
       .ph-root button,.ph-root input,.ph-root select,.ph-root textarea{font-family:inherit}.ph-root input[type=checkbox],.ph-root input[type=range]{accent-color:var(--ph-accent)}.ph-root input::placeholder,.ph-root textarea::placeholder{color:var(--ph-text-tertiary);opacity:1}.ph-root :focus-visible{outline:var(--dsw-focus-ring-width,2px) solid var(--dsw-focus-ring-color,var(--ph-accent));outline-offset:2px}
+      .ph-task-tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:4px 0 12px}.ph-task-search{box-sizing:border-box;flex:1 1 220px;min-width:160px;max-width:360px;border:.5px solid var(--ph-border);border-radius:8px;background:var(--ph-surface);color:var(--ph-text-primary);font:inherit;padding:7px 10px}.ph-task-select{display:flex;align-items:center;gap:5px;color:var(--ph-text-tertiary);font-size:10px;margin-bottom:6px}.ph-task-select input{margin:0}.ph-inline-notice,.ph-csv-preview{border:.5px solid var(--ph-border);border-radius:9px;padding:10px 12px;margin:8px 0 12px;background:var(--ph-surface)}.ph-csv-preview{max-width:860px}.ph-csv-preview p{margin:5px 0}.ph-csv-preview ul{margin:6px 0;padding-left:20px;font-size:12px;color:var(--ph-text-secondary)}.ph-csv-preview .ph-task-tools{margin-bottom:0}.ph-file-picker{position:relative}.ph-file-input{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
       .ph-projects{width:250px;min-width:220px;border-right:.5px solid var(--ph-border);display:flex;flex-direction:column;background:var(--dsw-specific-sidebar-fill,var(--ph-surface-alt));color:var(--ph-text-primary)}
       .ph-project-head{padding:20px 16px 12px;display:flex;align-items:center;justify-content:space-between;font-size:20px;font-weight:700;color:var(--ph-text-primary)}
       .ph-project-list{overflow:auto;padding:4px 10px;flex:1}.ph-project{width:100%;text-align:left;padding:12px;border:1px solid transparent;border-radius:10px;background:transparent;color:var(--ph-text-primary);cursor:pointer;margin-bottom:7px}.ph-project:hover{background:var(--ph-hover);border-color:var(--ph-border)}.ph-project.active{background:var(--ph-accent-soft);border-color:var(--ph-accent)}.ph-project small{display:block;color:var(--ph-text-tertiary);margin-top:4px}.ph-progress{height:5px;border-radius:8px;background:var(--ph-hover);margin-top:9px;overflow:hidden}.ph-progress i{display:block;height:100%;background:var(--ph-accent)}
@@ -80,7 +82,6 @@ window.__ModuleLoader__.load({
     }
 
     function buildProjectCsv(project) {
-      const headers = ['项目名称', '项目简介', '项目开始日期', '项目截止日期', '任务 ID', '任务名称', '状态', '优先级', '关键任务', '进度（%）', '任务开始日期', '任务截止日期', '负责人', '当前事项', '阻塞卡点', '任务节点记录', '任务说明']
       const tasks = Array.isArray(project.tasks) ? project.tasks : []
       const rows = (tasks.length ? tasks : [null]).map((task) => [
         project.name, project.description, project.startDate, project.dueDate,
@@ -89,7 +90,116 @@ window.__ModuleLoader__.load({
         (task?.assignees || []).map((person) => person.name || person.id).join('；'), task?.currentWork, task?.blocker,
         (task?.nodes || []).map((node) => `${new Date(node.at).toLocaleString()} ${taskNodeNames[node.kind] || node.kind}：${node.text}`).join('；'), task?.body
       ])
-      return `\uFEFF${[headers, ...rows].map((row) => row.map(csvCell).join(',')).join('\r\n')}`
+      return `\uFEFF${[projectCsvHeaders, ...rows].map((row) => row.map(csvCell).join(',')).join('\r\n')}`
+    }
+
+    function parseCsvRows(value) {
+      const input = String(value || '').replace(/^\uFEFF/, '')
+      const rows = []
+      let row = []
+      let cell = ''
+      let quoted = false
+      for (let index = 0; index < input.length; index++) {
+        const character = input[index]
+        if (quoted) {
+          if (character === '"' && input[index + 1] === '"') { cell += '"'; index++ }
+          else if (character === '"') quoted = false
+          else cell += character
+          continue
+        }
+        if (character === '"' && cell === '') quoted = true
+        else if (character === ',') { row.push(cell); cell = '' }
+        else if (character === '\r' || character === '\n') {
+          row.push(cell); cell = ''
+          if (row.some((field) => field.trim())) rows.push(row)
+          row = []
+          if (character === '\r' && input[index + 1] === '\n') index++
+        } else cell += character
+      }
+      if (quoted) throw new Error('CSV 引号没有成对闭合')
+      if (cell || row.length) {
+        row.push(cell)
+        if (row.some((field) => field.trim())) rows.push(row)
+      }
+      return rows
+    }
+
+    function parseProjectCsv(value, existingTaskIds = []) {
+      const text = String(value || '')
+      if (!text.trim()) throw new Error('CSV 文件为空')
+      if (text.length > 5 * 1024 * 1024) throw new Error('CSV 文件超过 5 MiB 限制')
+      const rows = parseCsvRows(text)
+      if (!rows.length) throw new Error('CSV 文件没有可读取的数据')
+      const headers = rows[0].map((header) => header.trim())
+      if (new Set(headers).size !== headers.length) throw new Error('CSV 表头包含重复列名')
+      if (!headers.includes('任务名称')) throw new Error('CSV 缺少「任务名称」列；请使用 Project Hub 导出的任务表格')
+      if (rows.length - 1 > 200) throw new Error('单次最多导入 200 项任务')
+      const column = Object.fromEntries(headers.map((header, index) => [header, index]))
+      const field = (row, name) => column[name] === undefined ? '' : String(row[column[name]] || '').trim()
+      const knownIds = existingTaskIds instanceof Set ? existingTaskIds : new Set(existingTaskIds)
+      const seenIds = new Set()
+      const tasks = []
+      let skippedExisting = 0
+      let skippedDuplicateIds = 0
+      let historyRows = 0
+      const parseChoice = (value, choices, fallback, label, rowNumber) => {
+        if (!value) return fallback
+        const match = Object.entries(choices).find(([key, name]) => key === value || name === value)
+        if (!match) throw new Error(`第 ${rowNumber} 行的${label}无效：「${value}」`)
+        return match[0]
+      }
+      const validDate = (value) => {
+        if (!value) return true
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false
+        const date = new Date(`${value}T00:00:00Z`)
+        return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value
+      }
+
+      for (let index = 1; index < rows.length; index++) {
+        const row = rows[index]
+        const title = field(row, '任务名称')
+        if (!title) continue
+        const rowNumber = index + 1
+        if (title.length > 200) throw new Error(`第 ${rowNumber} 行的任务名称超过 200 个字符`)
+        const sourceTaskId = field(row, '任务 ID')
+        if (sourceTaskId && knownIds.has(sourceTaskId)) { skippedExisting++; continue }
+        if (sourceTaskId && seenIds.has(sourceTaskId)) { skippedDuplicateIds++; continue }
+        if (sourceTaskId) seenIds.add(sourceTaskId)
+        const status = parseChoice(field(row, '状态'), statusNames, 'todo', '状态', rowNumber)
+        const priority = parseChoice(field(row, '优先级'), priorityNames, 'normal', '优先级', rowNumber)
+        const criticalValue = field(row, '关键任务').toLocaleLowerCase()
+        if (criticalValue && !['是', '否', 'true', 'false', '1', '0'].includes(criticalValue)) throw new Error(`第 ${rowNumber} 行的关键任务标记无效`)
+        const progressValue = field(row, '进度（%）')
+        const progress = progressValue ? Number(progressValue) : 0
+        if (!Number.isInteger(progress) || progress < 0 || progress > 100) throw new Error(`第 ${rowNumber} 行的进度必须是 0 到 100 的整数`)
+        const start = field(row, '任务开始日期')
+        const due = field(row, '任务截止日期')
+        if (!validDate(start) || !validDate(due)) throw new Error(`第 ${rowNumber} 行的日期格式无效；请使用 YYYY-MM-DD`)
+        if (start && due && due < start) throw new Error(`第 ${rowNumber} 行的截止日期早于开始日期`)
+        const assigneeNames = field(row, '负责人').split(/[；;]/).map((name) => name.trim()).filter(Boolean)
+        if (assigneeNames.some((name) => name.length > 80)) throw new Error(`第 ${rowNumber} 行的负责人名称超过 80 个字符`)
+        const currentWork = field(row, '当前事项')
+        const blocker = field(row, '阻塞卡点')
+        const body = field(row, '任务说明')
+        if (currentWork.length > 2000 || blocker.length > 2000) throw new Error(`第 ${rowNumber} 行的当前事项或阻塞卡点超过 2000 个字符`)
+        if (body.length > 100000) throw new Error(`第 ${rowNumber} 行的任务说明超过 100000 个字符`)
+        if (field(row, '任务节点记录')) historyRows++
+        tasks.push({
+          sourceTaskId,
+          title,
+          status,
+          priority,
+          critical: ['是', 'true', '1'].includes(criticalValue),
+          progress,
+          start,
+          due,
+          assignees: [...new Set(assigneeNames)].map((name) => ({ id: name, name })),
+          currentWork,
+          blocker,
+          body
+        })
+      }
+      return { tasks, skippedExisting, skippedDuplicateIds, historyRows }
     }
 
     function downloadProjectCsv(project) {
@@ -102,7 +212,6 @@ window.__ModuleLoader__.load({
       link.click()
       setTimeout(() => URL.revokeObjectURL(url), 0)
     }
-    return { PANEL_ID, API, STYLE_ID, statusNames, statusClasses, statusColors, taskNodeNames, priorityNames, officePlatforms, css, ensureStyles, request, dateObj, isoDay, localDay, defaultTaskDates, dayNumber, fromDayNumber, shiftDate, labelDate, csvCell, buildProjectCsv, downloadProjectCsv }
+    return { PANEL_ID, API, STYLE_ID, statusNames, statusClasses, statusColors, taskNodeNames, priorityNames, officePlatforms, css, ensureStyles, request, dateObj, isoDay, localDay, defaultTaskDates, dayNumber, fromDayNumber, shiftDate, labelDate, csvCell, buildProjectCsv, parseProjectCsv, downloadProjectCsv }
   }
 })
-

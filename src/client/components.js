@@ -77,7 +77,9 @@ window.__ModuleLoader__.load({
 
     function ProjectOverview({ project, onUpdate, onError, onPatchTask, onEditTask }) {
       const [editing, setEditing] = useState(false)
+      const [editingDates, setEditingDates] = useState(false)
       const [saving, setSaving] = useState(false)
+      const [dateSaving, setDateSaving] = useState(false)
       const [criticalPicker, setCriticalPicker] = useState(false)
       const [draft, setDraft] = useState(() => ({ name: project.name, description: project.description || '', startDate: project.startDate || '', dueDate: project.dueDate || '' }))
       useEffect(() => setDraft({ name: project.name, description: project.description || '', startDate: project.startDate || '', dueDate: project.dueDate || '' }), [project.id, project.updatedAt])
@@ -108,6 +110,21 @@ window.__ModuleLoader__.load({
           setEditing(false)
         } catch (error) { onError?.(error.message) } finally { setSaving(false) }
       }
+      const saveDates = async () => {
+        if (draft.startDate && draft.dueDate && draft.dueDate < draft.startDate) {
+          onError?.('项目截止日期不能早于开始日期')
+          return
+        }
+        setDateSaving(true)
+        try {
+          await onUpdate({ startDate: draft.startDate, dueDate: draft.dueDate })
+          setEditingDates(false)
+        } catch (error) { onError?.(error.message) } finally { setDateSaving(false) }
+      }
+      const toggleDateEditor = () => {
+        if (!editingDates) setDraft((current) => ({ ...current, startDate: project.startDate || allStarts[0] || '', dueDate: project.dueDate || allDues.at(-1) || '' }))
+        setEditingDates((value) => !value)
+      }
       return h('div', { className: 'ph-overview' },
         h('div', { className: 'ph-overview-hero' }, h('div', null,
           h('h2', null, project.name),
@@ -127,8 +144,12 @@ window.__ModuleLoader__.load({
           h('div', { className: 'ph-stat' }, h('div', { className: 'ph-stat-label' }, '项目周期'), h('div', { className: 'ph-stat-value', style: { fontSize: 15 } }, span), h('div', { className: 'ph-stat-note' }, `${tasks.filter((task) => task.start && task.due).length} 个任务已排期`)),
           h('div', { className: 'ph-stat' }, h('div', { className: 'ph-stat-label' }, '计划状态'), h('div', { className: `ph-stat-value ph-chip ${feasibility.cls}`, style: { fontSize: 13 } }, feasibility.label), h('div', { className: 'ph-stat-note' }, '依据阻塞与逾期任务统计')),
           h('div', { className: 'ph-stat' }, h('div', { className: 'ph-stat-label' }, '待处理关注项'), h('div', { className: 'ph-stat-value' }, risks.length), h('div', { className: 'ph-stat-note' }, `${blocked.length} 阻塞 · ${overdue.length} 逾期`))),
-        h('div', { className: 'ph-overview-card' }, h('div', { className: 'ph-overview-card-head' }, h('h3', null, '整体进度与日期范围'), h('button', { className: 'ph-btn small', onClick: () => setEditing(true) }, '编辑日期')),
+        h('div', { className: 'ph-overview-card' }, h('div', { className: 'ph-overview-card-head' }, h('h3', null, '整体进度与日期范围'), h('button', { type: 'button', className: 'ph-btn small', onClick: toggleDateEditor }, editingDates ? '收起日期' : '编辑日期')),
           h('div', { className: 'ph-timeline' }, h('span', { className: 'ph-toolbar-label' }, startDate ? labelDate(startDate) : '开始未定'), h('div', { className: 'ph-timeline-track' }, h('i', { style: { width: `${project.progress}%` } })), h('span', { className: 'ph-toolbar-label' }, dueDate ? labelDate(dueDate) : '截止未定')),
+          editingDates && h('div', { className: 'ph-inline-form' },
+            h('div', { className: 'ph-field' }, h('label', { htmlFor: 'ph-project-start-date' }, '项目开始日期'), h('input', { id: 'ph-project-start-date', type: 'date', max: draft.dueDate || undefined, value: draft.startDate, onChange: (event) => change('startDate', event.target.value) })),
+            h('div', { className: 'ph-field' }, h('label', { htmlFor: 'ph-project-due-date' }, '目标截止日期'), h('input', { id: 'ph-project-due-date', type: 'date', min: draft.startDate || undefined, value: draft.dueDate, onChange: (event) => change('dueDate', event.target.value) })),
+            h('div', { className: 'wide', style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } }, h('button', { type: 'button', className: 'ph-btn', disabled: dateSaving, onClick: () => { setDraft((current) => ({ ...current, startDate: project.startDate || allStarts[0] || '', dueDate: project.dueDate || allDues.at(-1) || '' })); setEditingDates(false) } }, '取消'), h('button', { type: 'button', className: 'ph-btn primary', disabled: dateSaving, onClick: saveDates }, dateSaving ? '保存中…' : '保存日期'))),
           h('div', { className: 'ph-meta' }, `关键任务 ${criticalTasks.length} · 有阻塞 ${blocked.length} · 逾期 ${overdue.length}`)),
         h('div', { className: 'ph-overview-grid' },
           h('div', null,
@@ -328,4 +349,3 @@ window.__ModuleLoader__.load({
     return { Icon, TaskEditor, ProjectOverview, Gantt, ProjectFilesView }
   }
 })
-

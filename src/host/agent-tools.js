@@ -1,5 +1,5 @@
 export function createAgentToolsMethods(shared) {
-  const { INTEGRATION_AGENT_ACTIONS, PROJECT_AGENT_ACTIONS, STANDARD_DSH_TOOL_NAMES, PROJECT_FILES_DIR, OUTBOUND_FILE_MAX_BYTES, TASK_NODE_KINDS, TASK_NODE_TEXT_MAX, fail, safeText, sanitizeInboundFilename, pickPatch } = shared
+  const { INTEGRATION_AGENT_ACTIONS, PROJECT_AGENT_ACTIONS, STANDARD_DSH_TOOL_NAMES, PROJECT_FILES_DIR, OUTBOUND_FILE_MAX_BYTES, TASK_NODE_KINDS, TASK_NODE_TEXT_MAX, fail, safeText, sanitizeInboundFilename, pickPatch, isWeComRecipientAuthorized } = shared
   return {
   currentExternalMessagePlatform(sessionId) {
     const activeTurns = new Set([this.wecomOpenTurns.get(sessionId), this.feishuOpenTurns.get(sessionId)].filter(Number.isSafeInteger))
@@ -175,12 +175,7 @@ export function createAgentToolsMethods(shared) {
       if (result?.project?.assistantSessionId !== sessionId) fail('企微助手工具只能由当前项目助手会话调用', 403)
       let binding = null
       try { binding = this.readStoredWeComBinding() } catch {}
-      let recipientAllowed = binding?.sessionId === sessionId && binding.userId === recipient
-      const env = globalThis.process?.env || {}
-      const configuredSessionId = typeof env.WECOM_DSH_SESSION_ID === 'string' ? env.WECOM_DSH_SESSION_ID.trim() : ''
-      const allowedUsers = String(env.WECOM_ALLOWED_USER_IDS || '').split(',').map((value) => value.trim()).filter(Boolean)
-      if (configuredSessionId === sessionId && allowedUsers.includes(recipient)) recipientAllowed = true
-      if (!recipientAllowed) fail('企微助手只能向当前会话已配对或环境变量授权的 UserID 发送消息', 403)
+      if (!isWeComRecipientAuthorized(recipient, sessionId, binding)) fail('企微助手只能向当前会话已配对或环境变量授权的 UserID 发送消息', 403)
       if (!this.wecomClient || this.wecomStatus.state !== 'connected') fail('企业微信智能机器人长连接未认证；请先配置 Bot ID/Secret 并确认连接状态', 503)
       await this.wecomClient.sendText({ recipient, content: text })
       return JSON.stringify({ sent: true, recipient })
@@ -189,4 +184,3 @@ export function createAgentToolsMethods(shared) {
   },
   }
 }
-

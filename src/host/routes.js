@@ -1,5 +1,5 @@
 export function createRoutesMethods(shared) {
-  const { PROJECT_FILE, TASKS_DIR, PROJECT_FILE_MAX_BYTES, TASK_ID, STATUS, PRIORITY, TASK_NODE_KINDS, TASK_NODE_LIMIT, TASK_NODE_TEXT_MAX, json, fail, safeText, parseDocument, serializeDocument, makeId, validDate, defaultTaskDates, normalizeAssignees, normalizeTaskNodes, bridgeJournalErrorCode } = shared
+  const { PROJECT_FILE, TASKS_DIR, PROJECT_FILE_MAX_BYTES, TASK_ID, STATUS, PRIORITY, TASK_NODE_KINDS, TASK_NODE_LIMIT, TASK_NODE_TEXT_MAX, json, fail, safeText, parseDocument, serializeDocument, makeId, validDate, defaultTaskDates, normalizeAssignees, normalizeTaskNodes, bridgeJournalErrorCode, isWeComRecipientAuthorized, isCredentialStoreAvailable } = shared
   return {
   async handleScoped(request) {
     const scopeGeneration = this.agentPresetRestoreGeneration
@@ -67,6 +67,24 @@ export function createRoutesMethods(shared) {
       }
       const { workspace, session, project } = await this.projectForSession(sessionId, request.signal)
       if (body.projectId && body.projectId !== project.id) fail('禁止从此工作区会话访问其他项目', 403)
+      if (body.action === 'plugin.diagnostics') {
+        const nodeVersion = globalThis.process?.versions?.node || '未知'
+        const nodeMajor = Number.parseInt(nodeVersion.split('.')[0], 10)
+        const connectionCheck = (id, label, connection) => ({
+          id,
+          label,
+          status: connection?.state === 'connected' ? 'ok' : connection?.state === 'not-configured' ? 'optional' : 'attention',
+          detail: connection?.label || '连接状态未知'
+        })
+        return json({ diagnostics: [
+          { id: 'plugin', label: 'Project Hub', status: 'ok', detail: '插件已加载并能响应 Host 请求' },
+          { id: 'node', label: 'Node.js', status: nodeMajor >= 20 ? 'ok' : 'attention', detail: `当前版本 ${nodeVersion}；要求 20 或更高版本` },
+          { id: 'filesystem', label: 'Workspace 文件服务', status: typeof this.ctx.fs?.readText === 'function' && typeof this.ctx.fs?.writeText === 'function' ? 'ok' : 'attention', detail: `当前 Workspace「${workspace.title}」已成功读取项目资料` },
+          { id: 'credential-store', label: '系统凭证库', status: isCredentialStoreAvailable() ? 'ok' : 'attention', detail: isCredentialStoreAvailable() ? '原生凭证模块可用' : '原生凭证模块不可用；可改用 Host 环境变量配置机器人凭证' },
+          connectionCheck('wecom', '企业微信', this.getWeComStatus()),
+          connectionCheck('feishu', '飞书', this.getFeishuStatus())
+        ] })
+      }
       if (body.action === 'wecom.configure') {
         const wecomConnection = this.saveWeComCredentials(body.botId, body.secret)
         return json({ configured: true, wecomConnection })
@@ -91,6 +109,9 @@ export function createRoutesMethods(shared) {
         const recipient = safeText(body.recipient, '企业微信接收目标', 128)
         const text = safeText(body.text, '企业微信消息', 2048)
         if (recipient.toLowerCase() === '@all') fail('企业微信禁止群发到 @all', 403)
+        let binding = null
+        try { binding = this.readStoredWeComBinding() } catch {}
+        if (!isWeComRecipientAuthorized(recipient, sessionId, binding)) fail('企业微信只能向当前会话已配对或环境变量授权的 UserID 发送消息', 403)
         if (!this.wecomClient || this.wecomStatus.state !== 'connected') fail('企业微信智能机器人长连接未认证；请配置 Bot ID/Secret 并刷新状态', 503)
         await this.wecomClient.sendText({ recipient, content: text })
         return json({ sent: true, recipient, projectId: project.id })
@@ -319,4 +340,3 @@ export function createRoutesMethods(shared) {
   },
   }
 }
-

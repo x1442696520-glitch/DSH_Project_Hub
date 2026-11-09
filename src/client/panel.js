@@ -5,14 +5,14 @@ window.__ModuleLoader__.load({
     const h = React.createElement
     const { useCallback, useEffect, useMemo, useRef, useState } = React
     const shared = require('dsh-project-hub/client/shared')
-    const { API, PANEL_ID, STYLE_ID, statusNames, statusClasses, statusColors, taskNodeNames, priorityNames, officePlatforms, css, ensureStyles, request, dateObj, isoDay, localDay, defaultTaskDates, dayNumber, fromDayNumber, shiftDate, labelDate, csvCell, buildProjectCsv, downloadProjectCsv } = shared
+    const { API, PANEL_ID, STYLE_ID, statusNames, statusClasses, statusColors, taskNodeNames, priorityNames, officePlatforms, css, ensureStyles, request, dateObj, isoDay, localDay, defaultTaskDates, dayNumber, fromDayNumber, shiftDate, labelDate, csvCell, buildProjectCsv, parseProjectCsv, downloadProjectCsv } = shared
     const { Icon, TaskEditor, ProjectOverview, Gantt, ProjectFilesView } = require('dsh-project-hub/client/components')
 
-    function ProjectManagementView({ sessionId, onOpenSession, workspacePath, workspaceTitle, onSendFiles, onEnsureFiles, onNormalizeWorkspace }) {
-      return h('div', { className: 'ph-workspace-view' }, h(Panel, { key: sessionId, sessionId, onOpenSession, workspacePath, workspaceTitle, onSendFiles, onEnsureFiles, onNormalizeWorkspace }))
+    function ProjectManagementView({ sessionId, onOpenSession, workspacePath, workspaceTitle, onSendFiles, onEnsureFiles, onPreviewNormalizeWorkspace, onNormalizeWorkspace }) {
+      return h('div', { className: 'ph-workspace-view' }, h(Panel, { key: sessionId, sessionId, onOpenSession, workspacePath, workspaceTitle, onSendFiles, onEnsureFiles, onPreviewNormalizeWorkspace, onNormalizeWorkspace }))
     }
 
-    function Panel({ sessionId, onOpenSession, workspaceId, workspacePath, workspaceTitle, onSendFiles, onEnsureFiles, onNormalizeWorkspace, onInitializeWorkspace }) {
+    function Panel({ sessionId, onOpenSession, workspaceId, workspacePath, workspaceTitle, onSendFiles, onEnsureFiles, onPreviewNormalizeWorkspace, onNormalizeWorkspace, onInitializeWorkspace }) {
       const [project, setProject] = useState(null)
       const activeId = project?.id || ''
       const [tab, setTab] = useState('overview')
@@ -36,10 +36,20 @@ window.__ModuleLoader__.load({
       const [feishuCredentialsNotice, setFeishuCredentialsNotice] = useState('')
       const [feishuPairingBusy, setFeishuPairingBusy] = useState(false)
       const [feishuNotice, setFeishuNotice] = useState('')
+      const [taskSearch, setTaskSearch] = useState('')
+      const [dueFilter, setDueFilter] = useState('all')
+      const [selectedTaskIds, setSelectedTaskIds] = useState(() => new Set())
+      const [bulkTargetStatus, setBulkTargetStatus] = useState('doing')
+      const [bulkUpdating, setBulkUpdating] = useState(false)
+      const [csvImportPreview, setCsvImportPreview] = useState(null)
+      const [csvImporting, setCsvImporting] = useState(false)
+      const [taskNotice, setTaskNotice] = useState('')
       const wecomSendDisabledReason = project?.wecomConnection?.state !== 'connected'
         ? `发送测试消息需要 Host 长连接已认证（当前：${project?.wecomConnection?.label || '状态未知'}）`
         : !wecomDraft.recipient.trim() || !wecomDraft.text.trim()
           ? '请填写企业微信 UserID 和消息内容后再发送。'
+          : wecomDraft.recipient.trim().toLocaleLowerCase() === '@all'
+            ? '此入口只支持单聊 UserID，不支持 @all 或群聊目标。'
           : ''
       const scopedRequest = useCallback((url = API, options = {}) => {
         if (options.method === 'POST') {
@@ -92,6 +102,13 @@ window.__ModuleLoader__.load({
           setWecomDraft((current) => ({ ...current, text: '' }))
         } catch (e) { setError(e.message) }
         finally { setWecomSending(false) }
+      }
+      const checkRuntimeEnvironment = async () => {
+        setError('')
+        try {
+          const result = await scopedRequest(API, { method: 'POST', cache: 'no-store', body: JSON.stringify({ action: 'plugin.diagnostics', projectId: activeId }) })
+          setProject((current) => current ? { ...current, runtimeDiagnostics: result.diagnostics || [] } : current)
+        } catch (failure) { setError(failure.message || String(failure)) }
       }
       const wecomCredentialErrorMessage = (error) => {
         const message = String(error?.message || error)
@@ -262,12 +279,104 @@ window.__ModuleLoader__.load({
         } catch (e) { setError(e.message) }
       }
       const boardTasks = project?.tasks || []
+      const readTaskCsv = async (event) => {
+        const input = event.target
+        const file = input.files?.[0]
+        if (!file) return
+        setTaskNotice('')
+        setError('')
+        try {
+          if (file.size > 5 * 1024 * 1024) throw new Error('CSV 文件超过 5 MiB 限制')
+          const parsed = parseProjectCsv(await file.text(), new Set(boardTasks.map((task) => task.id)))
+          setCsvImportPreview({ fileName: file.name, ...parsed, completedCount: 0 })
+        } catch (failure) {
+          setCsvImportPreview(null)
+          setError(failure.message || String(failure))
+        } finally { input.value = '' }
+      }
+      const importTaskCsv = async () => {
+        if (!csvImportPreview?.tasks?.length || csvImporting) return
+        if (!globalThis.confirm?.(`将从 ${csvImportPreview.fileName} 新增 ${csvImportPreview.tasks.length} 项任务；已有任务 ID 会跳过。不会修改现有任务。继续导入？`)) return
+        setCsvImporting(true); setTaskNotice(''); setError('')
+        let latestProject = project
+        let completedCount = 0
+        let currentTaskTitle = ''
+        try {
+          for (const task of csvImportPreview.tasks) {
+            currentTaskTitle = task.title
+            const created = await scopedRequest(API, { method: 'POST', body: JSON.stringify({ action: 'task.create', projectId: activeId, title: task.title, start: task.start, due: task.due }) })
+            latestProject = created.project
+            if (!created.createdTaskId) throw new Error(`创建任务「${task.title}」后未返回任务 ID`)
+            const updated = await scopedRequest(API, { method: 'POST', body: JSON.stringify({ action: 'task.update', projectId: activeId, taskId: created.createdTaskId, patch: { priority: task.priority, critical: task.critical, progress: task.progress, assignees: task.assignees, body: task.body } }) })
+            latestProject = updated.project
+            if (task.currentWork) {
+              const current = await scopedRequest(API, { method: 'POST', body: JSON.stringify({ action: 'task.node.add', projectId: activeId, taskId: created.createdTaskId, kind: 'current', nodeText: task.currentWork }) })
+              latestProject = current.project
+            }
+            if (task.blocker) {
+              const blocked = await scopedRequest(API, { method: 'POST', body: JSON.stringify({ action: 'task.node.add', projectId: activeId, taskId: created.createdTaskId, kind: 'blocker', nodeText: task.blocker }) })
+              latestProject = blocked.project
+            }
+            const statusResult = await scopedRequest(API, { method: 'POST', body: JSON.stringify({ action: 'task.update', projectId: activeId, taskId: created.createdTaskId, patch: { status: task.status } }) })
+            latestProject = statusResult.project
+            completedCount++
+            setCsvImportPreview((current) => current ? { ...current, completedCount } : current)
+          }
+          setProject(latestProject)
+          setCsvImportPreview(null)
+          setSelectedTaskIds(new Set())
+          setTaskNotice(`已从 CSV 新增 ${completedCount} 项任务`)
+        } catch (failure) {
+          setProject(latestProject)
+          setCsvImportPreview((current) => current ? { ...current, failed: true, completedCount } : current)
+          setError(`已完成 ${completedCount} 项；${currentTaskTitle ? `任务「${currentTaskTitle}」可能已部分写入。` : ''}${failure.message || String(failure)} 请刷新核对并处理已创建项，不要直接重试同一文件。`)
+        } finally { setCsvImporting(false) }
+      }
+      const applyBulkStatus = async () => {
+        const selectedTasks = boardTasks.filter((task) => selectedTaskIds.has(task.id))
+        if (!selectedTasks.length || bulkUpdating) return
+        if (!globalThis.confirm?.(`将把选中的 ${selectedTasks.length} 项任务设为「${statusNames[bulkTargetStatus]}」。继续？`)) return
+        setBulkUpdating(true); setTaskNotice(''); setError('')
+        let latestProject = project
+        let completedCount = 0
+        try {
+          for (const task of selectedTasks) {
+            const result = await scopedRequest(API, { method: 'POST', body: JSON.stringify({ action: 'task.update', projectId: activeId, taskId: task.id, patch: { status: bulkTargetStatus, ...(bulkTargetStatus === 'done' ? { progress: 100 } : {}) } }) })
+            latestProject = result.project
+            completedCount++
+          }
+          setProject(latestProject)
+          setSelectedTaskIds(new Set())
+          setTaskNotice(`已更新 ${completedCount} 项任务`)
+        } catch (failure) {
+          setProject(latestProject)
+          setError(`已更新 ${completedCount} 项任务，后续更新失败：${failure.message || String(failure)}`)
+        } finally { setBulkUpdating(false) }
+      }
+      const toggleTaskSelection = (taskId) => setSelectedTaskIds((current) => {
+        const next = new Set(current)
+        if (next.has(taskId)) next.delete(taskId); else next.add(taskId)
+        return next
+      })
+      const filteredTasks = useMemo(() => {
+        const query = taskSearch.trim().toLocaleLowerCase()
+        const today = localDay(new Date())
+        return boardTasks.filter((task) => {
+          const searchable = [task.title, task.id, task.currentWork, task.blocker, ...(task.assignees || []).flatMap((person) => [person.name, person.id])].filter(Boolean).join(' ').toLocaleLowerCase()
+          if (query && !searchable.includes(query)) return false
+          if (dueFilter === 'overdue' && (!task.due || task.due >= today || task.status === 'done')) return false
+          if (dueFilter === 'unscheduled' && task.due) return false
+          return true
+        })
+      }, [project, taskSearch, dueFilter])
+      const selectedTaskRows = boardTasks.filter((task) => selectedTaskIds.has(task.id))
+      const selectFilteredTasks = () => setSelectedTaskIds((current) => new Set([...current, ...filteredTasks.map((task) => task.id)]))
       const grouped = useMemo(() => ({
-        todo: boardTasks.filter((task) => task.status === 'todo'),
-        doing: boardTasks.filter((task) => task.status === 'doing'),
-        blocked: boardTasks.filter((task) => task.status === 'blocked'),
-        done: boardTasks.filter((task) => task.status === 'done')
-      }), [project])
+        todo: filteredTasks.filter((task) => task.status === 'todo'),
+        doing: filteredTasks.filter((task) => task.status === 'doing'),
+        blocked: filteredTasks.filter((task) => task.status === 'blocked'),
+        done: filteredTasks.filter((task) => task.status === 'done')
+      }), [filteredTasks])
       const openEditor = (task) => setEditing(task)
       const updateOverviewTask = async (taskId, patch) => {
         try { return await patchTask(taskId, patch) }
@@ -288,12 +397,28 @@ window.__ModuleLoader__.load({
       }
       const columns = ['todo', 'doing', 'blocked', 'done']
       const workspaceDirectoryName = String(workspacePath || '').replace(/[\\/]+$/, '').split(/[\\/]/).at(-1) || ''
-      const needsWorkspaceNormalization = Boolean(workspaceTitle && workspaceDirectoryName !== workspaceTitle)
+      const isWindowsWorkspacePath = /^[a-z]:[\\/]/i.test(String(workspacePath || '')) || String(workspacePath || '').startsWith('\\\\')
+      const isCaseOnlyWorkspaceNameDifference = isWindowsWorkspacePath && workspaceDirectoryName.toLocaleLowerCase() === String(workspaceTitle || '').toLocaleLowerCase()
+      const needsWorkspaceNormalization = Boolean(workspaceTitle && workspaceDirectoryName !== workspaceTitle && !isCaseOnlyWorkspaceNameDifference)
       const normalizeCurrentWorkspace = async () => {
-        if (!needsWorkspaceNormalization || normalizing || !onNormalizeWorkspace) return
-        if (!globalThis.confirm?.(`将把「${workspaceTitle}」项目资料与任务迁移到同名目录，并创建新的 DSH Workspace 和项目助手 Session。迁移成功后，旧 Workspace 会保留为「旧」备份（其中的其他文件和 files/ 附件不会自动复制或合并），旧会话历史仍保留但不再绑定；项目 ID、Workspace ID 和助手 Session ID 会变化。是否继续？`)) return
+        if (!needsWorkspaceNormalization || normalizing || !onPreviewNormalizeWorkspace || !onNormalizeWorkspace) return
         setNormalizing(true); setError('')
-        try { await onNormalizeWorkspace(sessionId, project, workspacePath, workspaceTitle) }
+        try {
+          const preview = await onPreviewNormalizeWorkspace(sessionId, project, workspacePath, workspaceTitle)
+          if (preview?.alreadyNormalized) return
+          const message = [
+            '目录迁移预览',
+            `项目：${preview.projectName}`,
+            `来源目录：${preview.sourcePath}`,
+            `目标目录：${preview.targetPath}`,
+            `将迁移 ${preview.taskCount} 项任务和 ${preview.taskNodeCount} 条任务记录，并创建新的 DSH Workspace 和项目助手 Session。`,
+            '旧 Workspace 会保留为备份，旧会话历史仍可用但不再绑定。项目 ID、Workspace ID 和助手 Session ID 会变化。',
+            '旧目录中的其他文件和 files/ 附件不会自动复制或合并。',
+            '是否继续？'
+          ].join('\n')
+          if (!globalThis.confirm?.(message)) return
+          await onNormalizeWorkspace(sessionId, project, workspacePath, workspaceTitle)
+        }
         catch (failure) { setError(failure.message || String(failure)) }
         finally { setNormalizing(false) }
       }
@@ -311,6 +436,8 @@ window.__ModuleLoader__.load({
         h('h2', null, '办公软件集成'),
         h('p', { className: 'ph-muted' }, '点击对应平台卡片展开该平台的连接信息和功能。'),
         h('button', { type: 'button', className: 'ph-btn primary', onClick: () => downloadProjectCsv(project) }, '导出项目表格 CSV（Excel / 飞书表格）'),
+        h('button', { type: 'button', className: 'ph-btn', style: { marginLeft: 8 }, onClick: checkRuntimeEnvironment }, '检查运行环境'),
+        Array.isArray(project.runtimeDiagnostics) && project.runtimeDiagnostics.length > 0 && h('div', { className: 'ph-notice', role: 'status', style: { marginTop: 8 } }, project.runtimeDiagnostics.map((check) => h('div', { key: check.id, style: { marginTop: 4 } }, `${check.status === 'ok' ? '正常' : check.status === 'optional' ? '未配置（可选）' : '需要处理'} · ${check.label}：${check.detail}`))),
         h('div', { className: 'ph-integration-grid' }, officePlatforms.map((platform) => {
           const selected = activeIntegration === platform.id
           const status = platform.id === 'wecom' ? (project.wecomConnection?.label || platform.status) : platform.id === 'feishu' ? (project.feishuConnection?.label || platform.status) : (platform.status || '尚未接入')
@@ -361,7 +488,7 @@ window.__ModuleLoader__.load({
             h('a', { href: 'https://developer.work.weixin.qq.com/document/path/90196', target: '_blank', rel: 'noopener noreferrer' }, '读取成员 API 文档'),
             '。'
           ),
-          h('p', { className: 'ph-muted' }, '面板手动发送会发给这里填写的 UserID；助手工具只允许发给当前会话已配对或由环境变量授权的 UserID。'),
+          h('p', { className: 'ph-muted' }, '仅支持单聊 UserID。收件人必须是当前会话已配对用户，或在 Host 的授权名单中；不支持 @all 和群聊 ID。'),
           h('form', { className: 'ph-task-create', onSubmit: sendWeComMessage },
             h('input', { value: wecomDraft.recipient, maxLength: 128, placeholder: '企业微信 UserID（单聊）', 'aria-label': '企业微信接收目标', onChange: (event) => setWecomDraft((current) => ({ ...current, recipient: event.target.value })) }),
             h('textarea', { value: wecomDraft.text, maxLength: 2048, placeholder: '输入要发送的 Markdown 文本…', 'aria-label': '企业微信消息内容', onChange: (event) => setWecomDraft((current) => ({ ...current, text: event.target.value })) }),
@@ -419,14 +546,31 @@ window.__ModuleLoader__.load({
             h('nav', { className: 'ph-tabs' }, [['overview', '概览'], ['tasks', '任务'], ['gantt', '甘特'], ['files', '项目文件'], ['integrations', '办公集成']].map(([key, label]) => h('button', { key, type: 'button', 'aria-pressed': tab === key, className: `ph-tab ${tab === key ? 'active' : ''}`, onClick: () => setTab(key) }, label)))),
           error && h('div', { className: 'ph-error', role: 'alert' }, error),
           (project.path !== '.' || !project.workspaceId || !project.assistantSessionId) && h('div', { className: 'ph-warning', role: 'status' }, h('span', null, '该项目尚未完整绑定到当前 Workspace 根目录。打开面板不会自动迁移；确认后可迁移/修复项目资料，旧来源文件将保留。'), h('button', { type: 'button', className: 'ph-btn small primary', disabled: initializing || !workspaceId, onClick: initializeCurrentWorkspace }, initializing ? '处理中…' : '迁移/修复项目资料')),
-          h('div', { className: 'ph-toolbar' }, tab === 'tasks' && h('button', { className: 'ph-btn primary', onClick: () => setShowTaskInput((v) => !v) }, '+ 新建任务'), tab === 'gantt' && h('span', { className: 'ph-toolbar-label' }, '自动适配项目周期 · 可拖动任务条改日期 · 允许并行交叉'), tab === 'files' && h('span', { className: 'ph-toolbar-label' }, '选择项目文件后可作为附件发送给项目助手'), h('span', { className: 'ph-spacer' }), tab !== 'files' && h('span', { className: 'ph-toolbar-label' }, `${tab === 'tasks' ? boardTasks.length : project.tasks.length} 个任务`)),
+          h('div', { className: 'ph-toolbar' }, tab === 'tasks' && h('button', { className: 'ph-btn primary', onClick: () => setShowTaskInput((v) => !v) }, '+ 新建任务'), tab === 'tasks' && h('label', { className: 'ph-btn ph-file-picker', title: '从 Project Hub 导出的 CSV 添加任务' }, '导入 CSV', h('input', { className: 'ph-file-input', type: 'file', accept: '.csv,text/csv', 'aria-label': '选择任务 CSV', onChange: readTaskCsv })), tab === 'gantt' && h('span', { className: 'ph-toolbar-label' }, '自动适配项目周期 · 可拖动任务条改日期 · 允许并行交叉'), tab === 'files' && h('span', { className: 'ph-toolbar-label' }, '选择项目文件后可作为附件发送给项目助手'), h('span', { className: 'ph-spacer' }), tab !== 'files' && h('span', { className: 'ph-toolbar-label' }, `${tab === 'tasks' ? boardTasks.length : project.tasks.length} 个任务`)),
           h('section', { className: 'ph-content' },
             tab === 'overview' ? h(ProjectOverview, { project, onUpdate: updateProject, onError: setError, onPatchTask: updateOverviewTask, onEditTask: openEditor }) : null,
             tab === 'integrations' ? renderIntegrations() : null,
             tab === 'files' ? h(ProjectFilesView, { sessionId, project, workspacePath, scopedRequest, onSendFiles, onEnsureFiles, onError: setError }) : null,
              tab === 'tasks' ? h(React.Fragment, null,
               showTaskInput && h('form', { className: 'ph-task-create', onSubmit: createTask }, h('input', { autoFocus: true, placeholder: '输入任务名称', value: taskName, onChange: (e) => setTaskName(e.target.value) }), h('button', { className: 'ph-btn primary' }, '创建'), h('button', { type: 'button', className: 'ph-btn', onClick: () => setShowTaskInput(false) }, '取消')),
-              h('div', { className: 'ph-board' }, columns.map((status) => h('section', { key: status, className: 'ph-column', onDragOver: (e) => e.preventDefault(), onDrop: async (e) => { e.preventDefault(); const id = e.dataTransfer.getData('text/task'); if (id) { const task = project.tasks.find((row) => row.id === id); if (task && task.status !== status) try { await patchTask(id, { status, ...(status === 'done' ? { progress: 100 } : {}) }) } catch (err) { setError(err.message) } } } }, h('h3', null, h('span', null, statusNames[status]), h('span', { className: 'ph-badge' }, grouped[status].length)), grouped[status].map((task) => h('article', { key: task.id, className: 'ph-task-card', draggable: true, onDragStart: (e) => e.dataTransfer.setData('text/task', task.id), onClick: () => openEditor(task) }, h('div', { className: 'ph-task-id' }, task.id), h('div', { className: 'ph-task-title' }, task.title), h('div', { className: 'ph-meta' }, h('span', null, task.assignees.length ? `${task.assignees.length} 位负责人` : '未指派'), task.due && h('span', null, `截止 ${labelDate(task.due)}`)), task.status === 'blocked' && h('div', { className: 'ph-task-node-preview blocker' }, task.blocker || '尚未记录阻塞卡点'), task.status === 'doing' && task.currentWork && h('div', { className: 'ph-task-node-preview current' }, task.currentWork), h('div', { className: 'ph-progress' }, h('i', { style: { width: `${task.progress}%` } })), h('div', { className: 'ph-meta', style: { justifyContent: 'space-between', marginTop: 5 } }, h('span', null, `${task.progress}%`), h('select', { className: 'ph-select-status ph-status-edit', value: task.status, 'aria-label': `更改任务状态：${task.title}`, onClick: (e) => e.stopPropagation(), onChange: (e) => { e.stopPropagation(); changeTaskStatus(task, e.target.value) } }, Object.entries(statusNames).map(([key, label]) => h('option', { key, value: key }, label))))))))))
+              h('div', { className: 'ph-task-tools' },
+                h('input', { className: 'ph-task-search', type: 'search', placeholder: '搜索名称、负责人、事项…', 'aria-label': '搜索任务', value: taskSearch, onChange: (event) => setTaskSearch(event.target.value) }),
+                h('select', { className: 'ph-select-status', 'aria-label': '按截止日期筛选', value: dueFilter, onChange: (event) => setDueFilter(event.target.value) }, h('option', { value: 'all' }, '所有任务'), h('option', { value: 'overdue' }, '已逾期'), h('option', { value: 'unscheduled' }, '未排期')),
+                h('span', { className: 'ph-toolbar-label' }, `${filteredTasks.length} / ${boardTasks.length} 项`),
+                h('button', { type: 'button', className: 'ph-btn small', onClick: selectFilteredTasks, disabled: !filteredTasks.length }, '选择筛选结果'),
+                h('button', { type: 'button', className: 'ph-btn small', onClick: () => setSelectedTaskIds(new Set()), disabled: !selectedTaskRows.length }, '清除选择'),
+                h('span', { className: 'ph-toolbar-label' }, `已选 ${selectedTaskRows.length} 项（当前筛选中 ${filteredTasks.filter((task) => selectedTaskIds.has(task.id)).length} 项）`),
+                h('select', { className: 'ph-select-status', 'aria-label': '批量设置任务状态', value: bulkTargetStatus, onChange: (event) => setBulkTargetStatus(event.target.value) }, Object.entries(statusNames).map(([key, label]) => h('option', { key, value: key }, label))),
+                h('button', { type: 'button', className: 'ph-btn small primary', onClick: applyBulkStatus, disabled: !selectedTaskRows.length || bulkUpdating }, bulkUpdating ? '正在更新…' : '批量改状态')),
+              taskNotice && h('div', { className: 'ph-inline-notice', role: 'status' }, taskNotice),
+              csvImportPreview && h('section', { className: 'ph-csv-preview', 'aria-label': 'CSV 导入预览' },
+                h('strong', null, `导入预览：${csvImportPreview.fileName}`),
+                h('p', { className: 'ph-muted' }, `将新增 ${csvImportPreview.tasks.length} 项；跳过 ${csvImportPreview.skippedExisting} 个已有任务 ID、${csvImportPreview.skippedDuplicateIds} 个重复 ID。${csvImportPreview.historyRows ? `有 ${csvImportPreview.historyRows} 行包含历史节点记录，这些记录不会重建；只会导入当前事项和阻塞卡点。` : ''}`),
+                csvImportPreview.tasks.length > 0 && h('ul', null, csvImportPreview.tasks.slice(0, 5).map((task, index) => h('li', { key: `${task.sourceTaskId || task.title}-${index}` }, `${task.title} · ${statusNames[task.status]} · ${priorityNames[task.priority]} · ${labelDate(task.start)} 至 ${labelDate(task.due)}`)), csvImportPreview.tasks.length > 5 && h('li', null, `另有 ${csvImportPreview.tasks.length - 5} 项…`)),
+                csvImportPreview.failed && h('p', { role: 'alert' }, '导入遇到错误，部分任务可能已写入。请刷新核对并处理已创建项后再导入同一文件，避免产生重复任务。'),
+                h('div', { className: 'ph-task-tools' }, h('button', { type: 'button', className: 'ph-btn primary', onClick: importTaskCsv, disabled: !csvImportPreview.tasks.length || csvImportPreview.failed || csvImporting }, csvImporting ? `正在导入 ${csvImportPreview.completedCount}/${csvImportPreview.tasks.length}…` : `新增 ${csvImportPreview.tasks.length} 项`), !csvImporting && h('button', { type: 'button', className: 'ph-btn', onClick: () => setCsvImportPreview(null) }, '取消'))),
+              filteredTasks.length === 0 && h('div', { className: 'ph-empty-note' }, boardTasks.length ? '没有符合条件的任务，试试更改搜索词或筛选条件。' : '还没有任务，点击“新建任务”或导入 CSV。'),
+              h('div', { className: 'ph-board' }, columns.map((status) => h('section', { key: status, className: 'ph-column', onDragOver: (e) => e.preventDefault(), onDrop: async (e) => { e.preventDefault(); const id = e.dataTransfer.getData('text/task'); if (id) { const task = project.tasks.find((row) => row.id === id); if (task && task.status !== status) try { await patchTask(id, { status, ...(status === 'done' ? { progress: 100 } : {}) }) } catch (err) { setError(err.message) } } } }, h('h3', null, h('span', null, statusNames[status]), h('span', { className: 'ph-badge' }, grouped[status].length)), grouped[status].map((task) => h('article', { key: task.id, className: 'ph-task-card', draggable: true, onDragStart: (e) => e.dataTransfer.setData('text/task', task.id), onClick: () => openEditor(task) }, h('label', { className: 'ph-task-select', onClick: (event) => event.stopPropagation() }, h('input', { type: 'checkbox', checked: selectedTaskIds.has(task.id), 'aria-label': `选择任务：${task.title}`, onChange: () => toggleTaskSelection(task.id) }), '选择'), h('div', { className: 'ph-task-id' }, task.id), h('div', { className: 'ph-task-title' }, task.title), h('div', { className: 'ph-meta' }, h('span', null, task.assignees.length ? `${task.assignees.length} 位负责人` : '未指派'), task.due && h('span', null, `截止 ${labelDate(task.due)}`)), task.status === 'blocked' && h('div', { className: 'ph-task-node-preview blocker' }, task.blocker || '尚未记录阻塞卡点'), task.status === 'doing' && task.currentWork && h('div', { className: 'ph-task-node-preview current' }, task.currentWork), h('div', { className: 'ph-progress' }, h('i', { style: { width: `${task.progress}%` } })), h('div', { className: 'ph-meta', style: { justifyContent: 'space-between', marginTop: 5 } }, h('span', null, `${task.progress}%`), h('select', { className: 'ph-select-status ph-status-edit', value: task.status, 'aria-label': `更改任务状态：${task.title}`, onClick: (e) => e.stopPropagation(), onChange: (e) => { e.stopPropagation(); changeTaskStatus(task, e.target.value) } }, Object.entries(statusNames).map(([key, label]) => h('option', { key, value: key }, label))))))))))
               : null,
             tab === 'gantt' ? h(Gantt, { project, onEdit: openEditor, onPatch: patchTask, onError: setError }) : null),
           editing && h(TaskEditor, { task: editing, onClose: () => setEditing(null), onSave: saveEditor, onAddNode: addTaskNode, onError: setError }))
@@ -436,4 +580,3 @@ window.__ModuleLoader__.load({
     return { ProjectManagementView, Panel }
   }
 })
-
