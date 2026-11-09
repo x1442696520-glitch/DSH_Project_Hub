@@ -34,12 +34,15 @@ window.__ModuleLoader__.load({
       .ph-gantt-legend{display:flex;gap:16px;align-items:center;padding:10px 14px;border-bottom:.5px solid var(--ph-border);font-size:12px;color:var(--ph-text-secondary);position:sticky;left:0;width:max-content;min-width:100%;box-sizing:border-box}.ph-gantt-legend-item{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}.ph-status-dot{display:inline-block;width:9px;height:9px;border-radius:50%;flex:none}.status-todo{background:var(--ph-text-tertiary)}.status-doing{background:var(--ph-accent)}.status-blocked{background:var(--ph-danger)}.status-done{background:var(--ph-success)}.ph-status-summary-row{display:flex;align-items:center;gap:9px;padding:8px 2px;border-bottom:.5px solid var(--ph-border);font-size:13px}.ph-status-summary-row strong{margin-left:auto}.ph-active-task{display:flex;align-items:flex-start;gap:9px;width:100%;text-align:left;padding:10px 2px;border:0;border-bottom:.5px solid var(--ph-border);background:transparent;color:var(--ph-text-primary);cursor:pointer;font:inherit}.ph-active-task strong{min-width:110px}.ph-active-task>span:last-child{color:var(--ph-text-secondary);overflow:hidden;text-overflow:ellipsis}.ph-active-task:hover{background:var(--ph-hover)}.ph-task-node-preview{font-size:11px;padding:6px 8px;border-radius:6px;margin:6px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ph-task-node-preview.current,.ph-node-callout.current{background:var(--ph-accent-soft);color:var(--ph-accent)}.ph-task-node-preview.blocker,.ph-node-callout.blocker{background:var(--ph-danger-soft);color:var(--ph-danger)}.ph-task-nodes{border:.5px solid var(--ph-border);border-radius:10px;padding:12px;margin:16px 0;background:var(--ph-surface-alt)}.ph-task-nodes h3{margin:0 0 10px;font-size:14px}.ph-node-callout{display:flex;flex-direction:column;gap:4px;padding:9px 10px;border-radius:7px;margin:8px 0;font-size:12px;white-space:pre-wrap}.ph-node-form{display:grid;grid-template-columns:minmax(120px,.35fr) 1fr auto;gap:8px;align-items:start;margin:10px 0}.ph-node-form select,.ph-node-form textarea{box-sizing:border-box;border:.5px solid var(--ph-border);border-radius:7px;padding:8px;font:inherit;color:var(--ph-text-primary);background:var(--ph-surface)}.ph-node-form textarea{min-height:58px;resize:vertical}.ph-node-list{max-height:300px;overflow:auto}.ph-node{padding:9px 2px;border-top:.5px solid var(--ph-border)}.ph-node-head{display:flex;justify-content:space-between;gap:10px;font-size:11px;color:var(--ph-text-secondary)}.ph-node-text{font-size:13px;white-space:pre-wrap;overflow-wrap:anywhere;margin-top:5px;color:var(--ph-text-primary)}.ph-node-resolved{font-size:10px;color:var(--ph-text-tertiary);margin-top:4px}
       @media(max-width:850px){.ph-overview-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.ph-overview-grid{grid-template-columns:1fr}.ph-overview-hero{display:block}.ph-inline-form{grid-template-columns:1fr}.ph-node-form{grid-template-columns:1fr}.ph-active-task{flex-wrap:wrap}}
     `
-    if (typeof document !== 'undefined' && !document.getElementById(STYLE_ID)) {
-      const tag = document.createElement('style')
-      tag.id = STYLE_ID
-      tag.textContent = css
-      document.head.appendChild(tag)
+    function ensureStyles() {
+      if (typeof document !== 'undefined' && !document.getElementById(STYLE_ID)) {
+        const tag = document.createElement('style')
+        tag.id = STYLE_ID
+        tag.textContent = css
+        document.head.appendChild(tag)
+      }
     }
+    ensureStyles()
 
     async function request(url = API, options = {}) {
       const response = await fetch(url, { cache: 'no-store', ...options, headers: { 'content-type': 'application/json', ...(options.headers || {}) } })
